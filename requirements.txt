@@ -1,0 +1,13 @@
+pandas>=1.5
+numpy>=1.23
+scikit-learn>=1.2
+xgboost>=1.7
+prophet>=1.1; python_version >= "3.8"
+pydantic>=2.0
+fastapi>=0.95
+uvicorn[standard]>=0.20
+streamlit>=1.20
+joblib>=1.2
+pytest>=7.0
+matplotlib>=3.6
+seaborn>=0.12
