@@ -1,3 +1,4 @@
+
 """Configuration partagée du projet.
 
 Contient chemins, constantes et utilitaire minimal pour créer les dossiers attendus.
@@ -47,3 +48,5 @@ if __name__ == "__main__":
 	ensure_dirs()
 	now = datetime.now().strftime(DATE_FORMAT)
 	print(f"Project directories ensured. DATE={now}")
+
+
