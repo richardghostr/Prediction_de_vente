@@ -34,10 +34,19 @@ streamlit run src/ui/streamlit_app.py
 ```
 
 Notes importantes
-- Placer un modèle d'exemple dans `models/artifacts/` (ex: `model_20260127_v1.pkl`) pour tester l'API et l'UI.
-- Les chemins et conventions sont définis dans `src/config.py`.
-- Pour exécuter les tests :
 
 ```powershell
 pytest -q
 ```
+
+## Politique de données brutes
+
+- Ne committez PAS de jeux de données volumineux dans le dépôt.
+- Utilisez `data/raw/` comme dossier local pour les données validées par `src/data/ingest.py`.
+- Procédure courte : déposer le(s) fichier(s) source localement puis exécuter :
+
+```powershell
+python src/data/ingest.py <chemin_vers_csv_ou_dossier> data/raw
+```
+
+- Ajoutez des métadonnées pour chaque ingestion (voir `data/raw/README.md`).

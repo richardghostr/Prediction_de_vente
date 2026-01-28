@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Environment
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data: do NOT commit large raw datasets. Keep README and small examples only.
+data/raw/*.csv
+data/raw/*.parquet
+data/raw/*.zip
+!data/raw/README.md
+!data/raw/sample*.csv
+
+# External/temporary sources
+data/external/
+
+# Processed data (optionally ignore, A may choose to commit small processed files)
+data/processed/
+data/interim/
+
+# Model artifacts: avoid committing large binary models. Keep .gitkeep if present.
+models/artifacts/*
+!models/artifacts/.gitkeep
+
+# Archive (may contain large snapshots)
+archive/
+
