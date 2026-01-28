@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+      - 'feat/**'
+  pull_request:
+    branches:
+      - dev
+      - main
+
+jobs:
+  test:
+    name: Test on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.10, 3.11]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies (if present)
+        run: |
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found — skipping dependency installation"
+          fi
+
+      - name: Run unit tests (if any)
+        run: |
+          if [ -d "tests" ]; then
+            pytest -q
+          else
+            echo "No tests/ directory — skipping tests"
+          fi
+
+      - name: Lint with flake8 (only if configured)
+        run: |
+          # Run lint only if flake8 appears in requirements.txt to avoid unexpected installs
+          if [ -f requirements.txt ] && grep -qE '(^|[[:space:]])flake8' requirements.txt; then
+            python -m pip install flake8
+            flake8 src tests || true
+          else
+            echo "flake8 not listed in requirements.txt — skipping lint"
+          fi
