@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    container_name: pdv_api
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./:/app:cached
+    command: uvicorn src.serve.api:app --host 0.0.0.0 --port 8000
+
+  streamlit:
+    build: .
+    container_name: pdv_streamlit
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      - ./:/app:cached
+    command: streamlit run src/ui/streamlit_app.py --server.port 8501 --server.address 0.0.0.0

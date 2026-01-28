@@ -1,0 +1,16 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+.git
+data/raw/
+models/artifacts/
+models/metrics/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+build/
+dist/
+Dockerfile
