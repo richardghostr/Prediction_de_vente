@@ -46,7 +46,8 @@ jobs:
       - name: Run unit tests (if any)
         run: |
           if [ -d "tests" ]; then
-            pytest -q
+            # Allow pytest exit code 5 (no tests collected) to be treated as success
+            pytest -q || test $? -eq 5
           else
             echo "No tests/ directory — skipping tests"
           fi
