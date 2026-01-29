@@ -21,7 +21,6 @@ data/raw/*.csv
 data/raw/*.parquet
 data/raw/*.zip
 !data/raw/README.md
-!data/raw/sample*.csv
 
 # External/temporary sources
 data/external/

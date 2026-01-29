@@ -82,13 +82,37 @@ def ingest_single_csv(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # output file name: <stem>_ingest<suffix>
+    out_name = f"{input_path.stem}_ingest{input_path.suffix}"
+    output_path = output_dir / out_name
+
     existing = find_existing_by_checksum(output_dir, checksum)
     if existing and not force:
-        if verbose:
-            print(f"[ingest] Fichier identique déjà présent: {existing} (skip)")
-        return existing
+        # If an identical file exists but with a different name, create a canonical ingest-named copy.
+        if existing.name == out_name:
+            if verbose:
+                print(f"[ingest] Fichier identique déjà présent: {existing} (skip)")
+            return existing
+        else:
+            # copy existing to the desired output name and copy metadata if present
+            import shutil
 
-    out_name = input_path.name
+            try:
+                shutil.copy2(existing, output_path)
+                # copy metadata if exists
+                existing_meta = existing.with_suffix(existing.suffix + ".metadata.json")
+                if existing_meta.exists():
+                    shutil.copy2(existing_meta, output_path.with_suffix(output_path.suffix + ".metadata.json"))
+                if verbose:
+                    print(f"[ingest] Fichier identique trouvé {existing}; copié vers {output_path}")
+                return output_path
+            except Exception:
+                if verbose:
+                    print(f"[ingest] Fichier identique trouvé {existing} (skip)")
+                return existing
+
+    # output file name: <stem>_ingest<suffix>
+    out_name = f"{input_path.stem}_ingest{input_path.suffix}"
     output_path = output_dir / out_name
 
     if dry_run:
@@ -106,11 +130,15 @@ def ingest_single_csv(
         "checksum": checksum,
     }
 
-    write_metadata(output_path, meta)
+    # write metadata only if caller requested it via attribute
+    write_meta_flag = getattr(ingest_single_csv, "write_meta", False)
+    if write_meta_flag:
+        write_metadata(output_path, meta)
 
     if verbose:
         print(f"[ingest] fichier validé et écrit dans: {output_path}")
-        print(f"[ingest] métadonnées écrites: {output_path.with_suffix(output_path.suffix + '.metadata.json')}")
+        if write_meta_flag:
+            print(f"[ingest] métadonnées écrites: {output_path.with_suffix(output_path.suffix + '.metadata.json')}")
 
     return output_path
 
@@ -149,6 +177,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Liste séparée par des virgules des colonnes requises (default=id,date,value)",
     )
     parser.add_argument("--no-verbose", dest="verbose", action="store_false", help="Réduire la verbosité")
+    parser.add_argument("--write-meta", dest="write_meta", action="store_true", help="Ecrire le fichier metadata JSON alongside the CSV (default: false)")
     return parser.parse_args(argv)
 
 
@@ -159,13 +188,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     force = bool(args.force)
     dry_run = bool(args.dry_run)
     pattern = args.pattern
+    write_meta = bool(getattr(args, "write_meta", False))
     required_cols = [c.strip() for c in args.required_cols.split(",") if c.strip()]
     verbose = bool(args.verbose)
 
     try:
         if input_path.is_file():
+            # pass write_meta flag to the single ingest function via attribute
+            ingest_single_csv.write_meta = write_meta
             ingest_single_csv(input_path, output_dir, required_cols, force=force, dry_run=dry_run, verbose=verbose)
         elif input_path.is_dir():
+            ingest_single_csv.write_meta = write_meta
             ingest_from_dir(input_path, output_dir, pattern=pattern, required_columns=required_cols, force=force, dry_run=dry_run, verbose=verbose)
         else:
             print(f"Chemin invalide : {input_path}")
