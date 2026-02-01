@@ -1,0 +1,76 @@
+# Fichier de configuration pour le mapping et la validation des données d'ingestion.
+
+# Cibles: Noms des colonnes finales dans le DataFrame transformé.
+targets:
+  - id
+  - date
+  - value
+
+# Alias: Liste de noms de colonnes possibles pour chaque cible.
+# L'algorithme de mapping essaiera de faire correspondre les colonnes du CSV
+# à ces alias en utilisant la similarité de chaînes de caractères.
+aliases:
+  id:
+    - id
+    - product_id
+    - item_id
+    - sku
+    - store
+    - store_id
+    - reference
+    - identifiant
+    - code_article
+  date:
+    - date
+    - sale_date
+    - sale-date
+    - timestamp
+    - order_date
+    - created_at
+    - jour
+    - date_commande
+    - date_vente
+    - sale_date
+    - datetime
+    - date_achat
+    - POSTING_DATE
+
+
+  value:
+    - qty
+    - quantity
+    - value
+    - sales
+    - amount
+    - price
+    - total
+    - ventes
+    - montant
+    - quantite
+    - qty_vendue
+    - total_vente
+    - qty_sold
+    
+    
+
+# Types de données: Types pandas cibles pour chaque colonne après transformation.
+# Utiliser des types optimisés pour réduire l'utilisation de la mémoire.
+# 'category' est idéal pour les identifiants textuels.
+data_types:
+  id: category
+  date: "datetime64[ns]"
+  value: "float32"
+
+# Règles de validation: Appliquées après la transformation.
+validation_rules:
+  # La colonne 'value' doit contenir des valeurs supérieures ou égales à 0.
+  value:
+    min: 0
+    # max: 100000 # Décommentez pour ajouter une limite maximale.
+  
+  # Seuil de tolérance pour les valeurs manquantes par colonne.
+  # Si le pourcentage de NaN/NaT dépasse ce seuil, la validation échoue.
+  missing_thresholds:
+    id: 0.01    # 1% de tolérance pour les IDs manquants
+    date: 0.05  # 5% de tolérance pour les dates manquantes
+    value: 0.05 # 5% de tolérance pour les valeurs manquantes

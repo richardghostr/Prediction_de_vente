@@ -20,6 +20,7 @@ Thumbs.db
 data/raw/*.csv
 data/raw/*.parquet
 data/raw/*.zip
+data/raw/errors/
 !data/raw/README.md
 
 # External/temporary sources
