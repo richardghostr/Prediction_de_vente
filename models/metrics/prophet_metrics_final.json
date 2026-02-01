@@ -1,0 +1,10 @@
+{
+  "MAE_test": 0.8116533346475241,
+  "RMSE_test": 1.0141252494523256,
+  "horizon_days": 30,
+  "train_size": 335,
+  "test_size": 30,
+  "CV_mae_mean": 1.3223933479686818,
+  "CV_rmse_mean": 1.5844559096741289,
+  "CV_folds": 3
+}
