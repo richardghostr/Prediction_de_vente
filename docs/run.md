@@ -33,6 +33,8 @@ uvicorn src.serve.api:app --reload --port 8000
 streamlit run src/ui/streamlit_app.py
 ```
 
+Note: The Streamlit UI propose un mode "Offline". Si l'API n'est pas démarrée, cochez "Offline mode" pour utiliser un fallback simple (last-value carry‑forward) afin d'obtenir un forecast local.
+
 Notes importantes
 
 ```powershell
