@@ -32,6 +32,7 @@ data/interim/
 
 # Model artifacts: avoid committing large binary models. Keep .gitkeep if present.
 models/artifacts/*
+models/metrics/*
 !models/artifacts/.gitkeep
 
 # Archive (may contain large snapshots)
