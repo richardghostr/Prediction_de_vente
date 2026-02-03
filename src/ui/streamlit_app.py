@@ -6,6 +6,15 @@ from pathlib import Path
 import os
 import plotly.graph_objects as go
 
+# Try to import pipeline helpers so the UI enforces ingest -> clean -> features
+try:
+    from src.data.clean import clean_dataframe
+except Exception:
+    clean_dataframe = None
+try:
+    from src.data.features import build_feature_pipeline
+except Exception:
+    build_feature_pipeline = None
 def detect_columns(df: pd.DataFrame):
     # detect date column: prefer common names, else choose the most-parseable column
     date_candidates = ["date", "Date", "ds", "timestamp", "datetime", "time", "sale_date", "saledate"]
@@ -78,7 +87,23 @@ if uploaded is not None:
         # auto-detect columns and show inputs (provide explicit keys to avoid duplicate widget ids)
         detected_date, detected_value = detect_columns(df)
         default_date = detected_date or "date"
-        default_value = detected_value or "value"
+
+        # Prefer `quantity` when available (model was trained on quantity by default).
+        # If `revenue` is detected but `quantity` exists, suggest switching to `quantity`.
+        cols_lower = [c.lower() for c in df.columns]
+        has_quantity = any('quantity' == c or 'qty' == c for c in cols_lower)
+
+        if has_quantity:
+            # Auto-select `quantity` when present (user requested automatic switch).
+            default_value = 'quantity'
+            # Inform the user that we auto-selected quantity, and how to override
+            st.info("Colonne 'quantity' détectée — sélection automatique de 'quantity' (utilisez le champ ci-dessous pour changer). Si vous voulez prédire le revenue/CA, sélectionnez 'revenue' manuellement et entraînez un modèle sur cette cible.")
+        else:
+            default_value = detected_value or 'value'
+
+        # If revenue-like column is selected explicitly, warn user
+        if detected_value and any(k in detected_value.lower() for k in ("rev", "revenue", "price")) and not has_quantity:
+            st.warning("Colonne 'revenue' détectée. Le modèle par défaut a été entraîné sur la quantité ('quantity'); les prévisions peuvent être hors échelle pour le revenue. Envisagez d'entraîner un modèle sur 'revenue'.")
         date_col = st.text_input("Colonne de date", value=default_date, key="date_col_input")
         value_col = st.text_input("Colonne de valeur", value=default_value, key="value_col_input")
 
@@ -97,6 +122,7 @@ if uploaded is not None:
             group_filter = st.selectbox("Filtrer par groupe ('All' pour tout voir)", options=["All"] + unique_vals, index=0, key="group_filter")
 
         aggregate = st.checkbox("Agréger les dates dupliquées (par somme)", value=True, key="aggregate_dup")
+        archive_outputs = st.checkbox("Archiver les sorties (interim/processed)", value=False, key="archive_outputs")
 
     st.subheader("Aperçu des données brutes")
     st.dataframe(df.head())
@@ -146,9 +172,51 @@ if uploaded is not None:
     else:
         df_for_series = df2
 
-    # Build series payload from df_for_series
+    # Run cleaning + feature pipeline to enforce chronology before building series
+    try:
+        if clean_dataframe is not None:
+            cleaned_df = clean_dataframe(df_for_series, date_col=date_col, value_col=value_col)
+        else:
+            cleaned_df = df_for_series
+    except Exception as e:
+        st.error(f"Erreur lors du nettoyage des données: {e}")
+        st.stop()
+
+    try:
+        if build_feature_pipeline is not None:
+            features_df = build_feature_pipeline(cleaned_df)
+        else:
+            features_df = None
+    except Exception as e:
+        st.warning(f"Échec du calcul des features: {e}")
+        features_df = None
+
+    # Optionally show previews of cleaned/features
+    st.subheader("Aperçu après nettoyage")
+    st.dataframe(cleaned_df.head())
+    if features_df is not None:
+        st.subheader("Aperçu des features")
+        st.dataframe(features_df.head())
+
+    # If user requested archiving, write interim/processed CSVs
+    if archive_outputs:
+        try:
+            out_interim = Path("data/interim")
+            out_processed = Path("data/processed")
+            out_interim.mkdir(parents=True, exist_ok=True)
+            out_processed.mkdir(parents=True, exist_ok=True)
+            interim_name = out_interim / f"uploaded_interim_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            cleaned_df.to_csv(interim_name, index=False)
+            if features_df is not None:
+                proc_name = out_processed / f"uploaded_features_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                features_df.to_csv(proc_name, index=False)
+            st.success(f"Sorties archivées: {interim_name}{' , ' + str(proc_name) if features_df is not None else ''}")
+        except Exception as e:
+            st.warning(f"Impossible d'archiver les sorties: {e}")
+
+    # Build series payload from cleaned_df (guarantees chronology applied)
     series = []
-    for _, row in df_for_series.iterrows():
+    for _, row in cleaned_df.iterrows():
         # ensure date cell is a Timestamp
         try:
             ds = pd.to_datetime(row[date_col])
@@ -164,6 +232,15 @@ if uploaded is not None:
         # include extras (exclude grouping column)
         extras = {k: v for k, v in row.items() if k not in (date_col, value_col, group_col)}
         item.update(extras)
+        # If the user selected a grouping column, include it as `id` so the model
+        # receives the entity identifier expected by the feature pipeline.
+        try:
+            if group_col != "None" and group_col in row.index:
+                gid = row[group_col]
+                # cast to str for safety
+                item["id"] = str(gid) if not pd.isna(gid) else None
+        except Exception:
+            pass
         series.append(item)
 
     if st.button("Lancer la prédiction"):
