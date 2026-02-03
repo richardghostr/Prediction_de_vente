@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 import logging
 
 from src.serve.schemas import SeriesRequest, ForecastResponse, ForecastPoint
@@ -105,6 +105,13 @@ def predict(request: SeriesRequest, horizon: int = Query(7, ge=1, le=365)):
             logger.exception("Error in naive forecast")
             raise HTTPException(status_code=500, detail=str(e))
 
+    # If model returned no id, propagate request.id for traceability
+    try:
+        if getattr(resp_obj, "id", None) is None and getattr(request, "id", None):
+            resp_obj.id = request.id
+    except Exception:
+        pass
+
     # At this point we have a ForecastResponse-compatible object; persist simple metrics
     try:
         metrics_dir = Path(config.MODELS_METRICS_DIR)
@@ -119,9 +126,8 @@ def predict(request: SeriesRequest, horizon: int = Query(7, ge=1, le=365)):
                 "horizon": horizon,
                 "n_points": len(request.series),
             }
-        from datetime import datetime
-
-        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        # use timezone-aware UTC timestamp
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         fname = f"prediction_{ts}_{resp_obj.id or 'anon'}.json"
         target = metrics_dir / fname
         with open(target, "w", encoding="utf-8") as fh:

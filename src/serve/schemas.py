@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Any, Dict
 from datetime import datetime, date
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 
 def _parse_date(v: Any) -> datetime:
@@ -28,20 +28,19 @@ def _parse_date(v: Any) -> datetime:
 class DataPoint(BaseModel):
 	"""One observation in a time series. Extra keys (regressors) are kept."""
 
+	model_config = ConfigDict(extra="allow")
+
 	date: datetime = Field(..., description="Observation date (parsed)")
 	value: Optional[float] = Field(None, description="Target value (sales)")
 	# allow extra regressors via dict
 	extras: Optional[Dict[str, Any]] = None
 
-	class Config:
-		extra = "allow"
-
-	@validator("date", pre=True)
+	@field_validator("date", mode="before")
 	def _validate_date(cls, v):
 		return _parse_date(v)
 
-	@root_validator(pre=True)
-	def capture_extras(cls, values):
+	@model_validator(mode="before")
+	def capture_extras(cls, values: Dict[str, Any]):
 		# collect unknown keys into `extras`
 		allowed = {"date", "value"}
 		extras = {k: v for k, v in values.items() if k not in allowed}
@@ -60,7 +59,7 @@ class SeriesRequest(BaseModel):
 	id: Optional[str] = Field(None, description="Optional series identifier")
 	series: List[DataPoint] = Field(..., description="Chronological observations")
 
-	@validator("series")
+	@field_validator("series")
 	def not_empty_and_sorted(cls, v: List[DataPoint]):
 		if not v:
 			raise ValueError("`series` must contain at least one datapoint")
@@ -74,24 +73,23 @@ class SeriesRequest(BaseModel):
 			return v_sorted
 		return v
 
-	@root_validator(skip_on_failure=True)
-	def ensure_some_values(cls, values):
-		series: List[DataPoint] = values.get("series", [])
+	@model_validator(mode="after")
+	def ensure_some_values(self):
+		series: List[DataPoint] = self.series
 		if not any(dp.value is not None for dp in series):
 			raise ValueError("At least one datapoint in `series` must have a `value`")
-		return values
+		return self
 
-	class Config:
-		schema_extra = {
-			"example": {
-				"id": "store_42",
-				"series": [
-					{"date": "2025-01-01", "value": 10},
-					{"date": "2025-01-02", "value": 12, "price": 99.9},
-					{"date": "2025-01-03", "value": 9, "marketing": 50},
-				],
-			}
+	model_config = ConfigDict(json_schema_extra={
+		"example": {
+			"id": "store_42",
+			"series": [
+				{"date": "2025-01-01", "value": 10},
+				{"date": "2025-01-02", "value": 12, "price": 99.9},
+				{"date": "2025-01-03", "value": 9, "marketing": 50},
+			],
 		}
+	})
 
 
 class ForecastPoint(BaseModel):
@@ -107,17 +105,16 @@ class ForecastResponse(BaseModel):
 	forecast: List[ForecastPoint]
 	metrics: Optional[Dict[str, Any]] = None
 
-	class Config:
-		schema_extra = {
-			"example": {
-				"id": "store_42",
-				"forecast": [
-					{"ds": "2025-02-01", "yhat": 11.2, "yhat_lower": 8.0, "yhat_upper": 14.5},
-					{"ds": "2025-02-02", "yhat": 12.0, "yhat_lower": 9.1, "yhat_upper": 15.3},
-				],
-				"metrics": {"MAE_test": 1.23, "RMSE_test": 1.75},
-			}
+	model_config = ConfigDict(json_schema_extra={
+		"example": {
+			"id": "store_42",
+			"forecast": [
+				{"ds": "2025-02-01", "yhat": 11.2, "yhat_lower": 8.0, "yhat_upper": 14.5},
+				{"ds": "2025-02-02", "yhat": 12.0, "yhat_lower": 9.1, "yhat_upper": 15.3},
+			],
+			"metrics": {"MAE_test": 1.23, "RMSE_test": 1.75},
 		}
+	})
 
 
 __all__ = ["DataPoint", "SeriesRequest", "ForecastPoint", "ForecastResponse"]
