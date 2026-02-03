@@ -94,6 +94,14 @@ def predict(request: SeriesRequest, horizon: int = Query(7, ge=1, le=365)):
                 resp_obj = ForecastResponse(**resp)
             else:
                 resp_obj = resp
+        except FileNotFoundError as e:
+            # No model artifact found; fall back to internal naive predictor
+            logger.warning("Model artifacts not found, falling back to naive forecast: %s", e)
+            try:
+                resp_obj = naive_forecast(request, horizon=horizon)
+            except Exception:
+                logger.exception("Error in naive fallback after missing model")
+                raise HTTPException(status_code=500, detail=str(e))
         except Exception as e:
             logger.exception("Error in user predict module")
             raise HTTPException(status_code=500, detail=f"Model prediction error: {e}")
