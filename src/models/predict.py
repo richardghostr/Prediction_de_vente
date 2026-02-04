@@ -46,7 +46,24 @@ def get_model():
             raise FileNotFoundError("No model found in models/artifacts")
     _MODEL_PATH = mp
     _MODEL = joblib.load(mp)
+    try:
+        # lightweight log to indicate which artifact was loaded
+        print(f"[models.predict] Loaded model artifact: {mp}")
+    except Exception:
+        pass
     return _MODEL
+
+
+def get_model_path() -> Optional[str]:
+    """Return the path to the loaded model artifact (or the candidate model path).
+
+    Useful for logging/tracing which .pkl will be used for prediction.
+    """
+    global _MODEL_PATH
+    if _MODEL_PATH is not None:
+        return str(_MODEL_PATH)
+    mp = _find_model()
+    return str(mp) if mp is not None else None
 
 
 def predict_series(series: List[Dict[str, Any]], horizon: int = 7, lags: List[int] = [1, 7, 14], windows: List[int] = [7, 14]):

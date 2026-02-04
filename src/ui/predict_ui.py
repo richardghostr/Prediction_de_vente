@@ -76,7 +76,15 @@ def build_series_from_df(df: pd.DataFrame, date_col: str = "date", value_col: st
                 item[c] = str(v)
         series.append(item)
 
-    return series, series_id
+    # compute aggregation info: number of original rows vs number of unique dates
+    try:
+        orig_count = int(df.shape[0])
+        unique_dates = int(df[date_col].dt.floor('D').nunique())
+        grouped_dates = int(grouped.shape[0])
+        agg_info = {"orig_rows": orig_count, "unique_dates": unique_dates, "grouped_rows": grouped_dates}
+    except Exception:
+        agg_info = {"orig_rows": len(df), "unique_dates": len(grouped), "grouped_rows": len(grouped)}
+    return series, series_id, agg_info
 
 
 def render_predict_ui():
@@ -124,7 +132,8 @@ def render_predict_ui():
                 st.error("`predict_series` non disponible dans l'environnement")
                 return
             try:
-                payload_series, suggested_id = build_series_from_df(df, id_col=id_col)
+                payload_series, suggested_id, agg_info = build_series_from_df(df, id_col=id_col)
+                st.info(f"Aggregation: {agg_info}")
                 res = predict_series(payload_series, horizon=horizon)
                 st.success("Prédiction terminée")
                 fc = pd.DataFrame(res.get("forecast", []))
@@ -156,7 +165,8 @@ def render_predict_ui():
             try:
                 import requests
 
-                payload_series, suggested_id = build_series_from_df(df, id_col=id_col)
+                payload_series, suggested_id, agg_info = build_series_from_df(df, id_col=id_col)
+                st.info(f"Aggregation: {agg_info}")
                 payload = {"id": series_id or suggested_id or None, "series": payload_series}
 
                 # Validate against API schema if available
