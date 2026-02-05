@@ -63,89 +63,6 @@ from src.utils.mapping_optimized import (
 )
 
 
-def pick_mapping(
-    df_raw: pd.DataFrame,
-    targets: List[str],
-    mapping_file: Optional[str],
-    aliases: Dict[str, Any],
-    verbose: bool = True,
-) -> Dict[str, str]:
-    """Detecte ou complète un mapping pour `targets`.
-
-    Cette fonction encapsule la heuristique de secours utilisée dans
-    `ingest_single_csv` afin d'être testable isolément.
-    """
-    mapping: Dict[str, str] = {}
-    if mapping_file:
-        with open(mapping_file, "r", encoding="utf-8") as f:
-            mapping = json.load(f)
-        if verbose:
-            print(f"[ingest] Mapping manuel chargé depuis {mapping_file}: {mapping}")
-        # continue: allow heuristics to fill missing targets from the manual mapping
-
-    mapping = find_best_mapping(df_raw, targets, aliases)
-    if verbose:
-        print(f"[ingest] Mapping automatique détecté: {mapping}")
-
-    # Heuristique de secours si le mapping est incomplet
-    if set(mapping.keys()) != set(targets):
-        norm = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
-        cols_norm = {norm(c): c for c in df_raw.columns}
-
-        def pick(keys, target):
-            for k in keys:
-                if k in cols_norm and target not in mapping:
-                    mapping[target] = cols_norm[k]
-                    return
-            # fallback contains
-            for nk, raw in cols_norm.items():
-                if any(k in nk for k in keys) and target not in mapping:
-                    mapping[target] = raw
-                    return
-
-        def pick_date_by_type():
-            best_col = None
-            best_score = 0
-            for col in df_raw.columns:
-                parsed = pd.to_datetime(df_raw[col].astype(str), errors='coerce', dayfirst=True, infer_datetime_format=True)
-                score = parsed.notna().mean()
-                if score > best_score and score >= 0.4:  # au moins 40% de parsable
-                    best_score = score
-                    best_col = col
-            if best_col and 'date' not in mapping:
-                mapping['date'] = best_col
-
-        # date
-        pick(["saledate", "date", "timestamp", "datetime"], 'date')
-        if 'date' not in mapping:
-            pick_date_by_type()
-        # id (priorité store puis sku)
-        pick(["store", "storeid", "id", "sku", "productid", "itemid"], 'id')
-        # value (priorité qty/quantity puis amount/revenue)
-        pick(["qty", "quantity", "value", "sales", "amount", "revenue"], 'value')
-
-        # Last resort: if still missing, pick the first unused column.
-        # Build a set of already-used columns to avoid fragile None comparisons.
-        used_cols = {v for v in mapping.values() if v is not None}
-
-        for col in df_raw.columns:
-            if 'id' not in mapping and col not in used_cols:
-                mapping['id'] = col
-                used_cols.add(col)
-                break
-
-        for col in df_raw.columns:
-            if 'value' not in mapping and col not in used_cols:
-                mapping['value'] = col
-                used_cols.add(col)
-                break
-
-        if verbose:
-            print(f"[ingest] Mapping heuristique appliqué: {mapping}")
-
-    return mapping
-
-
 def detect_delimiter(path: Path, default: str = ',') -> str:
     """Détecte le délimiteur principal du fichier (',' ';' '\t' '|')."""
     sample = path.read_text(encoding='utf-8', errors='ignore')[:4096]
@@ -272,7 +189,16 @@ def ingest_single_csv(
 
     # --- 1. Mapping des colonnes ---
     targets = config['targets']
-    mapping = pick_mapping(df_raw, targets, mapping_file, config.get('aliases', {}), verbose=verbose)
+    mapping = {}
+    if mapping_file:
+        with open(mapping_file, "r") as f:
+            mapping = json.load(f)
+        if verbose:
+            print(f"[ingest] Mapping manuel chargé depuis {mapping_file}: {mapping}")
+    else:
+        mapping = find_best_mapping(df_raw, targets, config['aliases'])
+        if verbose:
+            print(f"[ingest] Mapping automatique détecté: {mapping}")
 
     # Heuristique de secours si le mapping est incomplet
     if set(mapping.keys()) != set(targets):
@@ -311,20 +237,14 @@ def ingest_single_csv(
         # value (priorité qty/quantity puis amount/revenue)
         pick(["qty", "quantity", "value", "sales", "amount", "revenue"], 'value')
 
-        # Last resort: if still missing, pick the first unused column.
-        # Build a set of already-used columns to avoid fragile None comparisons.
-        used_cols = {v for v in mapping.values() if v is not None}
-
+        # Dernier secours: si toujours manquant, prend la première colonne libre
         for col in df_raw.columns:
-            if 'id' not in mapping and col not in used_cols:
+            if 'id' not in mapping and col != mapping.get('date') and col != mapping.get('value'):
                 mapping['id'] = col
-                used_cols.add(col)
                 break
-
         for col in df_raw.columns:
-            if 'value' not in mapping and col not in used_cols:
+            if 'value' not in mapping and col != mapping.get('date') and col != mapping.get('id'):
                 mapping['value'] = col
-                used_cols.add(col)
                 break
 
         if verbose:
@@ -476,12 +396,11 @@ def ingest_single_csv(
     }
 
     if getattr(ingest_single_csv, "write_meta", False):
-        try:
-            write_metadata(output_path, meta)
-            if verbose:
-                print(f"[ingest] Métadonnées écrites: {output_path.with_suffix(output_path.suffix + '.metadata.json')}")
-        except Exception as e:
-            print(f"[ingest] Impossible d'écrire les métadonnées: {e}", file=sys.stderr)
+        meta_path = output_path.with_suffix(".csv.meta.json")
+        with meta_path.open("w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, indent=2)
+        if verbose:
+            print(f"[ingest] Métadonnées écrites: {meta_path}")
 
     if verbose:
         print(f"[ingest] Fichier transformé, validé et écrit en CSV: {output_path}")
