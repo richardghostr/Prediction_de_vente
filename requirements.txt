@@ -13,3 +13,4 @@ matplotlib>=3.6
 seaborn>=0.12
 httpx>=0.24
 plotly>=5.14
+statsmodels>=0.14
