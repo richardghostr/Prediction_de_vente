@@ -33,9 +33,9 @@ def add_lags(
     df = df.copy()
     if lags is None:
         lags = [1]
-    df = df.sort_values(by=date_col)
-    for l in lags:
-        df[f"lag_{l}"] = df[value_col].shift(l)
+    df = df.sort_values(by=date_col).reset_index(drop=True)
+    for lag in lags:
+        df[f"lag_{lag}"] = df[value_col].shift(lag)
     return df
 
 
@@ -49,9 +49,11 @@ def add_rolling_features(
     if windows is None:
         windows = [3]
     df = df.sort_values(by=date_col)
+    # IMPORTANT: shift(1) to avoid data leakage - rolling stats must use only past values
+    shifted = df[value_col].shift(1)
     for w in windows:
-        df[f"roll_mean_{w}"] = df[value_col].rolling(window=w, min_periods=1).mean()
-        df[f"roll_std_{w}"] = df[value_col].rolling(window=w, min_periods=1).std().fillna(0)
+        df[f"roll_mean_{w}"] = shifted.rolling(window=w, min_periods=w).mean()
+        df[f"roll_std_{w}"] = shifted.rolling(window=w, min_periods=w).std().fillna(0)
     return df
 
 
