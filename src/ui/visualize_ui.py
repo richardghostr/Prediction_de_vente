@@ -187,11 +187,45 @@ def render_visualize_ui():
         if uploaded_hist is not None:
             try:
                 hist_df = pd.read_csv(uploaded_hist)
-                hist_df[date_col] = pd.to_datetime(hist_df[date_col])
-                for c in ("value", "y", "reel"):
+                # detect date column in the uploaded historical file and normalize to 'ds'
+                try:
+                    hist_df, hist_date = _normalize_date_column(hist_df)
+                except Exception:
+                    hist_date = None
+                if hist_date is None:
+                    # try common fallbacks
+                    for cand in ("ds", "date", "day", "timestamp"):
+                        if cand in hist_df.columns:
+                            hist_df[cand] = pd.to_datetime(hist_df[cand], errors="coerce")
+                            hist_date = cand
+                            break
+                if hist_date is None:
+                    raise KeyError("date column not found in uploaded historical file")
+
+                # normalize to 'ds'
+                if hist_date != "ds":
+                    hist_df["ds"] = pd.to_datetime(hist_df[hist_date], errors="coerce")
+                else:
+                    hist_df["ds"] = pd.to_datetime(hist_df["ds"], errors="coerce")
+
+                # detect y column in historical file and normalize to 'y'
+                hist_y = None
+                for c in ("value", "y", "reel", "real"):
                     if c in hist_df.columns:
-                        y_col = c
+                        hist_y = c
                         break
+                if hist_y is None:
+                    # try to infer numeric column other than date
+                    numcols = [c for c in hist_df.columns if pd.api.types.is_numeric_dtype(hist_df[c]) and c != "ds"]
+                    hist_y = numcols[0] if numcols else None
+                if hist_y is None:
+                    raise KeyError("y column not found in uploaded historical file")
+                if hist_y != "y":
+                    hist_df["y"] = pd.to_numeric(hist_df[hist_y], errors="coerce")
+                else:
+                    hist_df["y"] = pd.to_numeric(hist_df["y"], errors="coerce")
+                # keep only ds and y for historical
+                hist_df = hist_df[["ds", "y"]]
             except Exception as e:
                 st.warning(f"Impossible de lire l'historique : {e}")
     else:
