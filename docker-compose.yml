@@ -19,4 +19,4 @@ services:
       - PYTHONPATH=/app
     volumes:
       - ./:/app:cached
-    command: streamlit run src/ui/dashboard.py --server.port 8501 --server.address 0.0.0.0
+    command: streamlit run src/ui/streamlit_app.py --server.port 8501 --server.address 0.0.0.0

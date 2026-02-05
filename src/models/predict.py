@@ -1,21 +1,38 @@
+"""Prediction module for sales forecasting.
+
+Provides `predict_series(series, horizon)` for generating forecasts using
+a trained XGBoost model artifact. Supports iterative (autoregressive)
+forecasting where each predicted step is fed back as history.
+
+Usage (standalone test):
+    python -m src.models.predict
+"""
+
+import sys
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
-from pathlib import Path
 import joblib
-import sys
-from typing import List, Dict, Any, Optional
 
 CURRENT_FILE = Path(__file__).resolve()
 ROOT_DIR = CURRENT_FILE.parents[2]
+
+# Ensure project root on sys.path
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 ARTIFACTS_PATH = ROOT_DIR / "models" / "artifacts"
 
-
+# ---------------------------------------------------------------------------
 # Lazy model loader
+# ---------------------------------------------------------------------------
 _MODEL = None
 _MODEL_PATH = None
 
 
 def _find_model(pattern: str = "model_*_baseline.pkl") -> Optional[Path]:
+    """Find the most recent model artifact matching the pattern."""
     files = sorted(ARTIFACTS_PATH.glob(pattern))
     if not files:
         return None
@@ -23,18 +40,17 @@ def _find_model(pattern: str = "model_*_baseline.pkl") -> Optional[Path]:
 
 
 def get_model():
+    """Load and cache the model artifact. Creates a dummy if none found."""
     global _MODEL, _MODEL_PATH
     if _MODEL is not None:
         return _MODEL
     mp = _find_model()
     if mp is None:
-        # Try to create a tiny dummy baseline model artifact so the repo
-        # can run end-to-end even when no trained artifact is provided.
+        # Try to create a tiny dummy baseline so the repo can run end-to-end
         try:
             from sklearn.dummy import DummyRegressor
             ARTIFACTS_PATH.mkdir(parents=True, exist_ok=True)
             dummy = DummyRegressor(strategy="mean")
-            # simple training data to satisfy fit
             X = [[1], [2], [3], [4]]
             y = [10.0, 12.0, 11.0, 13.0]
             dummy.fit(X, y)
@@ -42,23 +58,15 @@ def get_model():
             joblib.dump(dummy, fname)
             mp = fname
         except Exception:
-            # If we cannot create a dummy (sklearn missing etc), surface as before
             raise FileNotFoundError("No model found in models/artifacts")
     _MODEL_PATH = mp
     _MODEL = joblib.load(mp)
-    try:
-        # lightweight log to indicate which artifact was loaded
-        print(f"[models.predict] Loaded model artifact: {mp}")
-    except Exception:
-        pass
+    print(f"[models.predict] Loaded model artifact: {mp}")
     return _MODEL
 
 
 def get_model_path() -> Optional[str]:
-    """Return the path to the loaded model artifact (or the candidate model path).
-
-    Useful for logging/tracing which .pkl will be used for prediction.
-    """
+    """Return the path to the loaded (or candidate) model artifact."""
     global _MODEL_PATH
     if _MODEL_PATH is not None:
         return str(_MODEL_PATH)
@@ -66,18 +74,67 @@ def get_model_path() -> Optional[str]:
     return str(mp) if mp is not None else None
 
 
-def predict_series(series: List[Dict[str, Any]], horizon: int = 7, lags: List[int] = [1, 7, 14], windows: List[int] = [7, 14]):
+def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
+    """Align DataFrame columns to match what the model expects.
+
+    - Adds missing columns (filled with 0)
+    - Drops unexpected columns
+    - Reorders to match model's training feature order
     """
-    Predict a horizon given a historical series (list of dicts with 'date' and 'value').
-    This function builds features iteratively using the project's `build_feature_pipeline` if available.
-    Returns dict compatible with ForecastResponse: {"id": None, "forecast": [{"ds":..., "yhat":...}, ...]}
+    expected = None
+    if hasattr(model, "feature_names_in_"):
+        expected = list(model.feature_names_in_)
+    elif hasattr(model, "get_booster"):
+        try:
+            expected = model.get_booster().feature_names
+        except Exception:
+            pass
+
+    if expected is None:
+        return X
+
+    X = X.copy()
+    # Add missing columns with zeros
+    for col in expected:
+        if col not in X.columns:
+            X[col] = 0
+    # Drop unexpected columns
+    extra = [c for c in X.columns if c not in expected]
+    if extra:
+        X = X.drop(columns=extra)
+    # Reorder
+    X = X[expected]
+    return X
+
+
+def predict_series(
+    series: List[Dict[str, Any]],
+    horizon: int = 7,
+    lags: Optional[List[int]] = None,
+    windows: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Predict a horizon given a historical series.
+
+    Args:
+        series: list of dicts with at least 'date' and 'value' keys.
+        horizon: number of future days to forecast.
+        lags: lag features to compute (default: [1, 7]).
+        windows: rolling window sizes (default: [3, 7]).
+
+    Returns:
+        dict compatible with ForecastResponse: {"id": None, "forecast": [...]}
     """
+    if lags is None:
+        lags = [1, 7]
+    if windows is None:
+        windows = [3, 7]
+
     try:
         from src.data.features import build_feature_pipeline
     except Exception:
         build_feature_pipeline = None
 
-    # normalize input to DataFrame
+    # Normalize input to DataFrame
     df = pd.DataFrame(series)
     if df.empty:
         raise ValueError("Empty series")
@@ -88,92 +145,83 @@ def predict_series(series: List[Dict[str, Any]], horizon: int = 7, lags: List[in
         df["value"] = pd.NA
     df = df.sort_values("date").reset_index(drop=True)
 
-    # If model missing, raise
-    try:
-        model = get_model()
-    except FileNotFoundError:
-        raise
+    # Load model
+    model = get_model()
 
-    # If no build_feature_pipeline available, fallback to simple last-value forecast
+    # If no feature pipeline available, fallback to simple last-value forecast
     if build_feature_pipeline is None:
-        last_val = None
-        for v in reversed(df["value"].tolist()):
-            if pd.notna(v):
-                last_val = float(v)
-                break
+        last_val = _get_last_value(df)
         if last_val is None:
             raise ValueError("No observed values to base forecast on")
-        forecast = []
-        last_date = df["date"].iloc[-1]
-        for i in range(1, horizon + 1):
-            ds = (last_date + pd.Timedelta(days=i)).strftime("%Y-%m-%d")
-            forecast.append({"ds": ds, "yhat": float(last_val)})
-        return {"id": None, "forecast": forecast}
+        return _naive_forecast(df, last_val, horizon)
 
-    # iterative forecasting using feature pipeline
+    # Iterative autoregressive forecasting using feature pipeline
     history = df.copy()
     forecast = []
+
     for step in range(1, horizon + 1):
-        # compute features for current history
+        # Compute features for current history
         try:
-            feats = build_feature_pipeline(history.rename(columns={"date": "date", "value": "value"}), lags=lags, windows=windows)
+            feats = build_feature_pipeline(
+                history,
+                date_col="date",
+                value_col="value",
+                lags=lags,
+                windows=windows,
+            )
         except Exception:
             feats = None
 
         if feats is None or feats.dropna().empty:
-            # fallback to last observed value
-            last_val = None
-            for v in reversed(history["value"].tolist()):
-                if pd.notna(v):
-                    last_val = float(v)
-                    break
+            # Fallback to last observed value
+            last_val = _get_last_value(history)
             if last_val is None:
                 raise ValueError("Insufficient history to compute features and no last value available")
             yhat = float(last_val)
         else:
-            # pick the last row with no NaNs in feature columns
-            X = feats.drop(columns=[c for c in feats.columns if c in ("value", "date")], errors="ignore")
-            X_last = X.dropna().iloc[[-1]]
-            # Align input columns to model expected features (if available)
-            try:
-                # sklearn estimator exposes `feature_names_in_` after fit
-                expected = None
-                if hasattr(model, "feature_names_in_"):
-                    expected = list(model.feature_names_in_)
-                # some pipelines expose get_feature_names_out
-                elif hasattr(model, "get_feature_names_out"):
-                    try:
-                        expected = list(model.get_feature_names_out())
-                    except Exception:
-                        expected = None
-
-                if expected:
-                    # keep only expected columns, add missing with zeros
-                    for col in expected:
-                        if col not in X_last.columns:
-                            X_last[col] = 0
-                    # drop unexpected
-                    extra_cols = [c for c in X_last.columns if c not in expected]
-                    if extra_cols:
-                        X_last = X_last.drop(columns=extra_cols)
-                    # reorder
-                    X_last = X_last[expected]
-
-            except Exception:
-                # If alignment fails, continue with original X_last and let model raise if incompatible
-                pass
-
-            # ensure column order stable and predict
-            yhat = float(model.predict(X_last)[0])
+            # Pick the last row with no NaNs in feature columns
+            exclude_cols = {"value", "date"}
+            X = feats.drop(columns=[c for c in feats.columns if c in exclude_cols], errors="ignore")
+            X_clean = X.dropna()
+            if X_clean.empty:
+                last_val = _get_last_value(history)
+                yhat = float(last_val) if last_val is not None else 0.0
+            else:
+                X_last = X_clean.iloc[[-1]]
+                X_last = _align_features_to_model(X_last, model)
+                yhat = float(model.predict(X_last)[0])
 
         last_date = history["date"].iloc[-1]
         next_date = last_date + pd.Timedelta(days=1)
         forecast.append({"ds": next_date.strftime("%Y-%m-%d"), "yhat": yhat})
-        # append predicted value to history for next iteration
-        history = pd.concat([history, pd.DataFrame([{"date": next_date, "value": yhat}])], ignore_index=True)
 
+        # Append predicted value to history for next iteration
+        new_row = pd.DataFrame([{"date": next_date, "value": yhat}])
+        history = pd.concat([history, new_row], ignore_index=True)
+
+    return {"id": None, "forecast": forecast}
+
+
+def _get_last_value(df: pd.DataFrame) -> Optional[float]:
+    """Get the last non-null value from the DataFrame."""
+    for v in reversed(df["value"].tolist()):
+        if pd.notna(v):
+            return float(v)
+    return None
+
+
+def _naive_forecast(
+    df: pd.DataFrame, last_val: float, horizon: int
+) -> Dict[str, Any]:
+    """Simple last-value carry-forward forecast."""
+    forecast = []
+    last_date = df["date"].iloc[-1]
+    for i in range(1, horizon + 1):
+        ds = (last_date + pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+        forecast.append({"ds": ds, "yhat": float(last_val)})
     return {"id": None, "forecast": forecast}
 
 
 if __name__ == "__main__":
     print("This module provides `predict_series(series, horizon)` for offline prediction.")
+    print(f"Model path: {get_model_path()}")
