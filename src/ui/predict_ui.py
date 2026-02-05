@@ -1,17 +1,17 @@
 """
-Reusable prediction UI component for Streamlit.
+Interface Streamlit avancee pour la prediction.
 
-Can be imported and called from the main dashboard or used standalone.
-Provides both online (API) and offline (local model) prediction modes
-with rich interactive visualizations.
+Supporte la prediction hors-ligne (modele local XGBoost) et en ligne (API).
+Fournit des graphiques interactifs, des metriques, un resume de prevision
+et des options d'export.
 
 Usage:
-    # As a standalone page
-    streamlit run src/ui/predict_ui.py
-
-    # As a component in the main dashboard
+    # En tant que composant du dashboard
     from src.ui.predict_ui import render_predict_ui
     render_predict_ui()
+
+    # En standalone
+    streamlit run src/ui/predict_ui.py
 """
 import os
 import sys
@@ -19,12 +19,12 @@ from pathlib import Path
 from datetime import timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 
-# Ensure project root on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -47,12 +47,13 @@ try:
 except Exception:
     clean_dataframe = None
 
-
 PALETTE = {
-    "primary": "#1B6B93",
-    "secondary": "#F39C12",
-    "success": "#27AE60",
+    "primary": "#0F4C75",
+    "primary_light": "#3282B8",
+    "secondary": "#E77728",
+    "success": "#2ECC71",
     "danger": "#E74C3C",
+    "warning": "#F39C12",
 }
 
 
@@ -66,24 +67,18 @@ def build_series_from_df(
     value_col: str = "value",
     id_col: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[str], Dict[str, int]]:
-    """
-    Build a list of datapoints suitable for the API / predict_series.
-
-    Returns (series_list, series_id, aggregation_info).
-    """
+    """Build a list of datapoints suitable for the API / predict_series."""
     df = df.copy()
     if date_col not in df.columns:
-        raise ValueError(f"Missing date column: {date_col}")
+        raise ValueError(f"Colonne de date manquante : {date_col}")
     df[date_col] = pd.to_datetime(df[date_col])
 
-    # Determine series_id
     series_id = None
     if id_col and id_col in df.columns:
         uniq = df[id_col].dropna().unique()
         if len(uniq) == 1:
             series_id = str(uniq[0])
 
-    # Aggregate duplicates
     agg_dict = {}
     for c in df.columns:
         if c in (date_col, id_col):
@@ -102,7 +97,6 @@ def build_series_from_df(
         if value_col in grouped.columns:
             val = row[value_col]
             item["value"] = None if pd.isna(val) else float(val)
-        # Extras
         for c in grouped.columns:
             if c in (date_col, value_col):
                 continue
@@ -125,14 +119,12 @@ def run_offline_prediction(
     horizon: int,
 ) -> Dict[str, Any]:
     """Run prediction using the local model or naive fallback."""
-    # Try trained model
     if predict_series is not None:
         try:
             return predict_series(series, horizon=horizon)
         except Exception as e:
             st.warning(f"Modele local indisponible ({e}), repli vers la prediction naive.")
 
-    # Naive fallback
     last_val = None
     last_date = None
     for s in reversed(series):
@@ -163,7 +155,6 @@ def run_api_prediction(
 
     payload = {"id": series_id, "series": series}
 
-    # Optional schema validation
     if SeriesRequest is not None:
         try:
             SeriesRequest.model_validate(payload)
@@ -177,7 +168,6 @@ def run_api_prediction(
 
     result = resp.json()
 
-    # Validate response
     if ForecastResponse is not None:
         try:
             ForecastResponse.model_validate(result)
@@ -191,7 +181,7 @@ def display_forecast_results(
     forecast_result: Dict[str, Any],
     hist_df: Optional[pd.DataFrame] = None,
 ) -> None:
-    """Display forecast results with rich visualizations."""
+    """Display forecast results with rich interactive visualizations."""
     fc = pd.DataFrame(forecast_result.get("forecast", []))
     if fc.empty:
         st.warning("La prediction n'a retourne aucun resultat.")
@@ -201,7 +191,7 @@ def display_forecast_results(
 
     # Metrics
     if forecast_result.get("metrics"):
-        st.subheader("Metriques")
+        st.subheader("Metriques du modele")
         metrics = forecast_result["metrics"]
         cols = st.columns(min(len(metrics), 4))
         for i, (k, v) in enumerate(metrics.items()):
@@ -215,7 +205,7 @@ def display_forecast_results(
     st.subheader("Resume de la prevision")
     kpi_cols = st.columns(4)
     with kpi_cols[0]:
-        st.metric("Nb de jours prevus", len(fc))
+        st.metric("Jours prevus", len(fc))
     with kpi_cols[1]:
         st.metric("Moyenne", f"{fc['yhat'].mean():.2f}")
     with kpi_cols[2]:
@@ -223,27 +213,42 @@ def display_forecast_results(
     with kpi_cols[3]:
         st.metric("Max", f"{fc['yhat'].max():.2f}")
 
-    # Chart
+    # Trend indicator
+    if hist_df is not None and not hist_df.empty:
+        last_hist_val = hist_df["y"].iloc[-1]
+        avg_fc = fc["yhat"].mean()
+        if last_hist_val != 0:
+            pct_change = ((avg_fc - last_hist_val) / last_hist_val) * 100
+            trend = "hausse" if pct_change > 0 else "baisse"
+            st.markdown(
+                f"<div style='background: {'#EAFAF1' if pct_change > 0 else '#FDEDEC'}; "
+                f"border-left: 4px solid {PALETTE['success'] if pct_change > 0 else PALETTE['danger']}; "
+                f"padding: 0.6rem 1rem; border-radius: 0 0.5rem 0.5rem 0; margin: 0.5rem 0;'>"
+                f"<strong>Tendance :</strong> {pct_change:+.1f}% en {trend} par rapport a la derniere valeur historique"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+    # Main chart
     st.subheader("Graphique de prevision")
     fig = go.Figure()
 
-    # Historical
     if hist_df is not None and not hist_df.empty:
         fig.add_trace(go.Scatter(
             x=hist_df["ds"], y=hist_df["y"],
             mode="lines", name="Historique",
             line=dict(color=PALETTE["primary"], width=2),
+            hovertemplate="Date: %{x}<br>Historique: %{y:,.2f}<extra></extra>",
         ))
 
-    # Forecast
     fig.add_trace(go.Scatter(
         x=fc["ds"], y=fc["yhat"],
         mode="lines+markers", name="Prediction",
-        line=dict(color=PALETTE["secondary"], width=2, dash="dash"),
-        marker=dict(size=4),
+        line=dict(color=PALETTE["secondary"], width=2.5, dash="dash"),
+        marker=dict(size=5),
+        hovertemplate="Date: %{x}<br>Prediction: %{y:,.2f}<extra></extra>",
     ))
 
-    # Confidence intervals
     if "yhat_upper" in fc.columns and "yhat_lower" in fc.columns:
         upper = pd.to_numeric(fc["yhat_upper"], errors="coerce")
         lower = pd.to_numeric(fc["yhat_lower"], errors="coerce")
@@ -253,39 +258,75 @@ def display_forecast_results(
             ))
             fig.add_trace(go.Scatter(
                 x=fc["ds"], y=lower, mode="lines", line=dict(width=0),
-                fill="tonexty", fillcolor="rgba(243,156,18,0.15)",
+                fill="tonexty", fillcolor="rgba(231, 119, 40, 0.15)",
                 name="Intervalle de confiance",
             ))
 
+    # Transition line
+    if hist_df is not None and not hist_df.empty:
+        last_date = hist_df["ds"].iloc[-1]
+        last_val = hist_df["y"].iloc[-1]
+        first_fc_date = fc["ds"].iloc[0]
+        first_fc_val = fc["yhat"].iloc[0]
+        fig.add_trace(go.Scatter(
+            x=[last_date, first_fc_date],
+            y=[last_val, first_fc_val],
+            mode="lines",
+            line=dict(color="#95A5A6", width=1.5, dash="dot"),
+            showlegend=False,
+        ))
+
     fig.update_layout(
-        height=450,
+        height=500,
         xaxis_title="Date",
         yaxis_title="Valeur",
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(l=0, r=0, t=10, b=0),
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    # Weekly breakdown
+    if len(fc) > 7:
+        st.divider()
+        st.subheader("Prevision par semaine")
+        fc_weekly = fc.set_index("ds").resample("W")["yhat"].agg(["sum", "mean", "count"]).reset_index()
+        fc_weekly.columns = ["Semaine", "Total", "Moyenne", "Nb jours"]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            fig_weekly = px.bar(
+                fc_weekly, x="Semaine", y="Total",
+                color_discrete_sequence=[PALETTE["secondary"]],
+            )
+            fig_weekly.update_layout(height=350, margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig_weekly, use_container_width=True)
+        with c2:
+            st.dataframe(fc_weekly.round(2), use_container_width=True, hide_index=True, height=350)
 
     # Deviation analysis
     if hist_df is not None and not hist_df.empty:
         combined = pd.merge(hist_df, fc, on="ds", how="inner")
         if not combined.empty and "y" in combined.columns and "yhat" in combined.columns:
-            st.subheader("Analyse des ecarts (sur la zone de recouvrement)")
-            combined["deviation_%"] = (
+            st.divider()
+            st.subheader("Analyse des ecarts (zone de recouvrement)")
+            combined["ecart_abs"] = (combined["y"] - combined["yhat"]).abs().round(2)
+            combined["ecart_pct"] = (
                 (combined["y"] - combined["yhat"]) / combined["y"].replace(0, float("nan")) * 100
             ).round(2)
             st.dataframe(
-                combined[["ds", "y", "yhat", "deviation_%"]].rename(
-                    columns={"y": "Reel", "yhat": "Predit", "deviation_%": "Ecart (%)"}
+                combined[["ds", "y", "yhat", "ecart_abs", "ecart_pct"]].rename(
+                    columns={"y": "Reel", "yhat": "Predit", "ecart_abs": "Ecart abs.", "ecart_pct": "Ecart (%)"}
                 ),
                 use_container_width=True,
+                hide_index=True,
             )
 
-    # Data table
+    # Data table & download
+    st.divider()
     st.subheader("Donnees de prevision")
-    st.dataframe(fc, use_container_width=True)
+    st.dataframe(fc, use_container_width=True, hide_index=True)
 
-    # Download
     csv = fc.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Telecharger les previsions (CSV)",
@@ -301,9 +342,9 @@ def display_forecast_results(
 def render_predict_ui() -> None:
     """Render the full prediction UI panel."""
     st.header("Prediction avancee")
-    st.write(
-        "Selectionnez un fichier source (nettoye ou avec features) ou chargez un CSV "
-        "pour lancer une prediction en mode hors-ligne ou en ligne via l'API."
+    st.markdown(
+        "Selectionnez un fichier source ou chargez un CSV "
+        "pour lancer une prediction en mode hors-ligne (modele local) ou en ligne (API)."
     )
 
     # Source selection
@@ -319,14 +360,13 @@ def render_predict_ui() -> None:
     value_col = "value"
 
     if source_option == "Fichiers du pipeline":
-        # Discover existing pipeline files
         interim_dir = Path("data/interim")
         processed_dir = Path("data/processed")
         candidates = []
-        if interim_dir.exists():
-            candidates += sorted(interim_dir.glob("*.csv"))
         if processed_dir.exists():
-            candidates += sorted(processed_dir.glob("*.csv"))
+            candidates += sorted(processed_dir.glob("*.csv"), reverse=True)
+        if interim_dir.exists():
+            candidates += sorted(interim_dir.glob("*.csv"), reverse=True)
 
         if not candidates:
             st.info(
@@ -345,7 +385,6 @@ def render_predict_ui() -> None:
         except Exception as e:
             st.error(f"Erreur de lecture : {e}")
             return
-
     else:
         uploaded = st.file_uploader("Charger un CSV", type=["csv"], key="predict_csv_upload")
         if uploaded is not None:
@@ -378,14 +417,40 @@ def render_predict_ui() -> None:
 
     # Preview
     st.subheader("Apercu des donnees")
-    st.dataframe(df.head(10), use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Lignes", f"{len(df):,}")
+    with c2:
+        st.metric("Colonnes", f"{len(df.columns)}")
+    with c3:
+        if value_col in df.columns:
+            st.metric(f"Moy. {value_col}", f"{df[value_col].mean():.2f}")
+    st.dataframe(df.head(10), use_container_width=True, hide_index=True)
 
-    # Config
+    # Prediction config
+    st.divider()
+    st.subheader("Configuration de la prediction")
     c1, c2 = st.columns(2)
     with c1:
         horizon = st.slider("Horizon de prediction (jours)", 1, 365, 30, key="predict_horizon")
     with c2:
         mode = st.radio("Mode", options=["Hors-ligne", "En ligne (API)"], horizontal=True, key="predict_mode")
+
+    # Model status
+    if get_model_path:
+        try:
+            mp = get_model_path()
+            if mp:
+                st.markdown(
+                    f"<div style='background: #EAFAF1; border-left: 4px solid {PALETTE['success']}; "
+                    f"padding: 0.5rem 1rem; border-radius: 0 0.5rem 0.5rem 0;'>"
+                    f"<strong>Modele disponible :</strong> {Path(mp).name}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.warning("Aucun artefact de modele trouve. La prediction naive sera utilisee.")
+        except Exception:
+            st.warning("Impossible de verifier le statut du modele.")
 
     # ID column detection
     id_col = None
@@ -394,7 +459,7 @@ def render_predict_ui() -> None:
             id_col = c
             break
 
-    # API settings (only shown for online mode)
+    # API settings
     api_base = None
     if mode == "En ligne (API)":
         api_base = st.text_input(
@@ -403,11 +468,11 @@ def render_predict_ui() -> None:
             key="predict_api_url",
         )
 
-    # Run
+    # Run prediction
     if st.button("Lancer la prediction", type="primary", use_container_width=True, key="predict_run"):
         with st.spinner("Preparation et prediction en cours..."):
             try:
-                # Clean data first
+                # Clean data
                 if clean_dataframe is not None:
                     df_clean = clean_dataframe(df, date_col=date_col, value_col=value_col)
                 else:
@@ -442,8 +507,7 @@ def render_predict_ui() -> None:
                         series_id=series_id,
                     )
 
-                # Display
-                st.success("Prediction terminee")
+                st.success("Prediction terminee !")
                 display_forecast_results(result, hist_df=hist_df)
 
             except Exception as e:
@@ -455,4 +519,15 @@ def render_predict_ui() -> None:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     st.set_page_config(page_title="Prediction", layout="wide")
+    st.markdown("""
+    <style>
+        .block-container { padding-top: 1rem; }
+        h1 { color: #0F4C75; font-weight: 700; }
+        h2 { color: #1B2631; font-weight: 600; border-bottom: 2px solid #0F4C75; padding-bottom: 0.3rem; }
+        div[data-testid="stMetric"] {
+            background: #FFFFFF; padding: 1rem; border-radius: 0.75rem;
+            border-left: 4px solid #0F4C75; box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }
+    </style>
+    """, unsafe_allow_html=True)
     render_predict_ui()
