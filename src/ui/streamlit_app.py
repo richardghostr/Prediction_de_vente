@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from datetime import timedelta
 import csv
+import io
 
 import numpy as np
 import pandas as pd
@@ -433,31 +434,51 @@ if uploaded is None:
 # Load data (robust to different delimiters)
 # ---------------------------------------------------------------------------
 try:
-    # Streamlit uploaded file is file-like; read a small sample to sniff delimiter
+    # Read whole upload (stream may be bytes or text)
     try:
         uploaded.seek(0)
     except Exception:
         pass
-    sample = uploaded.read(4096)
-    # sample may be bytes when uploaded via Streamlit
-    if isinstance(sample, bytes):
-        sample_text = sample.decode("utf-8", errors="ignore")
-    else:
-        sample_text = str(sample)
+    raw = uploaded.read()
 
-    # Try csv.Sniffer to detect delimiter, fallback to ';' if present else ','
+    # Prepare a sample text for delimiter sniffing
+    if isinstance(raw, bytes):
+        sample_text = raw[:8192].decode("utf-8", errors="ignore")
+    else:
+        sample_text = str(raw)[:8192]
+
+    # Detect delimiter
     try:
         dialect = csv.Sniffer().sniff(sample_text)
         sep = dialect.delimiter
     except Exception:
         sep = ';' if ';' in sample_text and sample_text.count(';') > sample_text.count(',') else ','
 
-    # Reset stream and read with detected separator
-    try:
-        uploaded.seek(0)
-    except Exception:
-        pass
-    df_raw = pd.read_csv(uploaded, sep=sep)
+    # Try common encodings if pandas raises decoding error
+    encodings_to_try = [None, "utf-8", "cp1252", "latin-1"]
+    df_raw = None
+    for enc in encodings_to_try:
+        try:
+            if isinstance(raw, bytes):
+                # Use BytesIO and pass encoding when not None
+                bio = io.BytesIO(raw)
+                if enc:
+                    df_raw = pd.read_csv(bio, sep=sep, encoding=enc)
+                else:
+                    df_raw = pd.read_csv(bio, sep=sep)
+            else:
+                # raw is str
+                s = io.StringIO(raw)
+                df_raw = pd.read_csv(s, sep=sep)
+            break
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            # If parsing fails for other reasons, keep trying encodings
+            continue
+
+    if df_raw is None:
+        raise ValueError("Impossible de decoder/parse le fichier CSV avec les encodages tries")
 except Exception as e:
     st.error(f"Erreur de lecture du CSV : {e}")
     st.stop()
