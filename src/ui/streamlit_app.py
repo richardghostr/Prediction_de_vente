@@ -17,6 +17,7 @@ import os
 import sys
 from pathlib import Path
 from datetime import timedelta
+import csv
 
 import numpy as np
 import pandas as pd
@@ -429,10 +430,34 @@ if uploaded is None:
 
 
 # ---------------------------------------------------------------------------
-# Load data
+# Load data (robust to different delimiters)
 # ---------------------------------------------------------------------------
 try:
-    df_raw = pd.read_csv(uploaded)
+    # Streamlit uploaded file is file-like; read a small sample to sniff delimiter
+    try:
+        uploaded.seek(0)
+    except Exception:
+        pass
+    sample = uploaded.read(4096)
+    # sample may be bytes when uploaded via Streamlit
+    if isinstance(sample, bytes):
+        sample_text = sample.decode("utf-8", errors="ignore")
+    else:
+        sample_text = str(sample)
+
+    # Try csv.Sniffer to detect delimiter, fallback to ';' if present else ','
+    try:
+        dialect = csv.Sniffer().sniff(sample_text)
+        sep = dialect.delimiter
+    except Exception:
+        sep = ';' if ';' in sample_text and sample_text.count(';') > sample_text.count(',') else ','
+
+    # Reset stream and read with detected separator
+    try:
+        uploaded.seek(0)
+    except Exception:
+        pass
+    df_raw = pd.read_csv(uploaded, sep=sep)
 except Exception as e:
     st.error(f"Erreur de lecture du CSV : {e}")
     st.stop()
