@@ -24,6 +24,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
+import io
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -387,12 +388,65 @@ def render_predict_ui() -> None:
             return
     else:
         uploaded = st.file_uploader("Charger un CSV", type=["csv"], key="predict_csv_upload")
+
+        # Try to restore uploaded from dashboard_state cache
+        try:
+            if uploaded is None and "dashboard_state" in st.session_state:
+                ufiles = st.session_state["dashboard_state"].get("uploaded_files", {})
+                if ufiles and ufiles.get("predict"):
+                    data = ufiles["predict"].get("data")
+                    name = ufiles["predict"].get("name")
+                    if data:
+                        uploaded = io.BytesIO(data)
+                        uploaded.name = name or "restored_predict.csv"
+        except Exception:
+            pass
+
         if uploaded is not None:
             try:
-                df = pd.read_csv(uploaded)
+                try:
+                    uploaded.seek(0)
+                except Exception:
+                    pass
+                data_bytes = uploaded.read()
+                # Persist to dashboard_state
+                try:
+                    st.session_state.setdefault("dashboard_state", {}).setdefault("uploaded_files", {})["predict"] = {
+                        "name": getattr(uploaded, "name", "predict.csv"),
+                        "data": data_bytes,
+                    }
+                except Exception:
+                    pass
+                # durable copy
+                try:
+                    cache_dir = PROJECT_ROOT / "data" / "interim" / ".dashboard_cache"
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    if data_bytes is not None:
+                        with open(cache_dir / "predict_uploaded.csv", "wb") as _f:
+                            _f.write(data_bytes)
+                except Exception:
+                    pass
+                # Load dataframe from bytes
+                df = pd.read_csv(io.BytesIO(data_bytes))
             except Exception as e:
                 st.error(f"Erreur de lecture : {e}")
                 return
+
+    # Fallback: restore previously cached parsed dataframe if available
+    if df is None:
+        try:
+            last = st.session_state.get("dashboard_state", {}).get("last_results", {})
+            p = last.get("predict_df")
+            if p:
+                try:
+                    df = pd.read_pickle(p)
+                except Exception:
+                    try:
+                        df = pd.read_csv(p)
+                    except Exception:
+                        df = None
+        except Exception:
+            df = None
 
     if df is None:
         return

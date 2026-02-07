@@ -12,6 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import pickle
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -54,18 +55,63 @@ def render_clean_ui():
         )
         return
 
+    # Restore previously selected file from dashboard_state if available
+    saved_sel = None
+    try:
+        saved_sel = st.session_state.get("dashboard_state", {}).get("module_params", {}).get("clean", {}).get("selected")
+    except Exception:
+        saved_sel = None
+
+    options = ["-- Selectionnez un fichier --"] + [str(p) for p in files]
+    default_index = 0
+    if saved_sel and saved_sel in options:
+        default_index = options.index(saved_sel)
+
     selected = st.selectbox(
         "Choisir un fichier a nettoyer",
-        options=["-- Selectionnez un fichier --"] + [str(p) for p in files],
+        options=options,
+        index=default_index,
         key="clean_file_sel",
     )
+
+    # Save selection to dashboard_state
+    try:
+        st.session_state.setdefault("dashboard_state", {}).setdefault("module_params", {}).setdefault("clean", {})["selected"] = selected
+    except Exception:
+        pass
 
     if not selected or selected == "-- Selectionnez un fichier --":
         return
 
-    # Load the file
+    # Load the file (try cached pickle first)
+    df = None
     try:
-        df = pd.read_csv(selected)
+        cache_dir = PROJECT_ROOT / "data" / "interim" / ".dashboard_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        cache_dir = None
+
+    try:
+        # Attempt to load cached pickle for this selected file
+        if cache_dir is not None:
+            pkl = cache_dir / f"clean_{Path(selected).stem}.pkl"
+            if pkl.exists():
+                try:
+                    df = pd.read_pickle(pkl)
+                except Exception:
+                    df = None
+
+        if df is None:
+            df = pd.read_csv(selected)
+            # Save parsed DataFrame to cache for faster restore
+            try:
+                if cache_dir is not None:
+                    pkl = cache_dir / f"clean_{Path(selected).stem}.pkl"
+                    df.to_pickle(pkl)
+                    # record in dashboard_state
+                    st.session_state.setdefault("dashboard_state", {}).setdefault("last_results", {})["clean_df"] = str(pkl)
+            except Exception:
+                pass
     except Exception as e:
         st.error(f"Impossible de lire le fichier : {e}")
         return

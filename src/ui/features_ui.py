@@ -52,15 +52,53 @@ def render_features_ui():
         )
         return
 
+    # Restore previous selection if present in dashboard_state
+    saved_sel = None
+    try:
+        saved_sel = st.session_state.get("dashboard_state", {}).get("module_params", {}).get("features", {}).get("selected")
+    except Exception:
+        saved_sel = None
+
+    options = [str(p) for p in files]
+    index = options.index(saved_sel) if saved_sel in options else 0
     selected = st.selectbox(
         "Choisir un fichier nettoye",
-        options=[str(p) for p in files],
+        options=options,
+        index=index,
         key="features_file_sel",
     )
 
-    # Load selected file
+    # persist selection
     try:
-        df = pd.read_csv(selected)
+        st.session_state.setdefault("dashboard_state", {}).setdefault("module_params", {}).setdefault("features", {})["selected"] = selected
+    except Exception:
+        pass
+
+    # Load selected file, prefer cached pickle
+    df = None
+    try:
+        cache_dir = PROJECT_ROOT / "data" / "interim" / ".dashboard_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        cache_dir = None
+
+    try:
+        if cache_dir is not None:
+            pkl = cache_dir / f"features_{Path(selected).stem}.pkl"
+            if pkl.exists():
+                try:
+                    df = pd.read_pickle(pkl)
+                except Exception:
+                    df = None
+        if df is None:
+            df = pd.read_csv(selected)
+            try:
+                if cache_dir is not None:
+                    pkl = cache_dir / f"features_{Path(selected).stem}.pkl"
+                    df.to_pickle(pkl)
+                    st.session_state.setdefault("dashboard_state", {}).setdefault("last_results", {})["features_df"] = str(pkl)
+            except Exception:
+                pass
     except Exception as e:
         st.error(f"Impossible de lire le fichier : {e}")
         return

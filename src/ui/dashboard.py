@@ -26,6 +26,43 @@ from src.ui import ingest_ui, clean_ui, predict_ui, visualize_ui, features_ui
 
 
 # =====================================================================
+# INITIALIZE SESSION STATE FOR PERSISTENCE
+# =====================================================================
+if "dashboard_state" not in st.session_state:
+    st.session_state["dashboard_state"] = {
+        "last_page": "home",
+        "uploaded_files": {},  # Store uploaded files by module
+        "module_params": {},  # Store parameters for each module
+        "last_results": {},  # Store last results from each module
+    }
+
+# Restore last visited page if it exists
+if "restore_page" not in st.session_state:
+    st.session_state["restore_page"] = True
+
+# On-disk cache dir for dashboard (helps survive hard reloads)
+CACHE_DIR = PROJECT_ROOT / "data" / "interim" / ".dashboard_cache"
+try:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    CACHE_DIR = None
+
+# Optionally restore previous dashboard_state from disk (pickle)
+if CACHE_DIR is not None:
+    try:
+        ds_path = CACHE_DIR / "dashboard_state.pkl"
+        if ds_path.exists():
+            import pickle
+            with open(ds_path, "rb") as _f:
+                loaded = pickle.load(_f)
+            # Only replace if loaded is a dict with expected keys
+            if isinstance(loaded, dict) and "last_page" in loaded:
+                st.session_state["dashboard_state"] = loaded
+    except Exception:
+        pass
+
+
+# =====================================================================
 # CONFIGURATION
 # =====================================================================
 PALETTE = {
@@ -133,12 +170,24 @@ with st.sidebar:
     st.caption("Navigation par phase du pipeline")
     st.divider()
 
+    # Get last visited page index
+    last_page_key = st.session_state["dashboard_state"]["last_page"]
+    page_keys = list(PAGES.keys())
+    try:
+        default_index = page_keys.index([k for k, v in PAGES.items() if v == last_page_key][0])
+    except (IndexError, ValueError):
+        default_index = 0
+
     page = st.radio(
         "Phase du pipeline",
-        options=list(PAGES.keys()),
-        index=0,
+        options=page_keys,
+        index=default_index if st.session_state.get("restore_page", True) else 0,
         key="pipeline_page",
     )
+    
+    # Save current page to session state
+    st.session_state["dashboard_state"]["last_page"] = PAGES[page]
+    st.session_state["restore_page"] = True
 
     st.divider()
 
@@ -170,6 +219,49 @@ with st.sidebar:
             st.markdown(f"<span style='color: #95A5A6;'>&#9675;</span> {step_name}", unsafe_allow_html=True)
 
     st.divider()
+    
+    # Show persistence status
+    st.markdown("### 💾 État de la session")
+    
+    # Always show session info
+    n_files = len(st.session_state["dashboard_state"]["uploaded_files"])
+    n_results = len(st.session_state["dashboard_state"]["last_results"])
+    n_params = len(st.session_state["dashboard_state"]["module_params"])
+    
+    if n_files > 0 or n_results > 0 or n_params > 0:
+        if n_files > 0:
+            st.success(f"📂 {n_files} fichier(s) en mémoire")
+        if n_results > 0:
+            st.info(f"📊 {n_results} résultat(s) sauvegardé(s)")
+        if n_params > 0:
+            st.info(f"⚙️ {n_params} module(s) configuré(s)")
+        
+        if st.button("🗑️ Réinitialiser tout", key="reset_all_dashboard", use_container_width=True):
+            st.session_state["dashboard_state"] = {
+                "last_page": "home",
+                "uploaded_files": {},
+                "module_params": {},
+                "last_results": {},
+            }
+
+            # Remove on-disk cache if present
+            try:
+                if CACHE_DIR is not None and CACHE_DIR.exists():
+                    for f in CACHE_DIR.iterdir():
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            st.session_state["restore_page"] = False
+            st.success("✅ Session réinitialisée!")
+            st.rerun()
+    else:
+        st.caption("Aucune donnée en cache")
+    
+    st.divider()
     st.markdown(
         "<div style='text-align:center; color: rgba(255,255,255,0.4); font-size:0.75rem;'>"
         "Prediction de Vente v2.0<br>Pipeline Dashboard"
@@ -182,6 +274,16 @@ with st.sidebar:
 # MAIN CONTENT
 # =====================================================================
 selected_page = PAGES[page]
+
+# Persist dashboard state to disk so a hard reload retains uploaded files and module params
+try:
+    if CACHE_DIR is not None:
+        ds_path = CACHE_DIR / "dashboard_state.pkl"
+        import pickle
+        with open(ds_path, "wb") as _f:
+            pickle.dump(st.session_state.get("dashboard_state", {}), _f)
+except Exception:
+    pass
 
 if selected_page == "home":
     st.title("Pipeline de Prediction de Vente")

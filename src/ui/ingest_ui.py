@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import shutil
 import tempfile
+import io
 
 import pandas as pd
 import plotly.express as px
@@ -56,6 +57,19 @@ def render_ingest_ui():
         help="Formats supportes : CSV avec separateur virgule, point-virgule ou tabulation",
     )
 
+    # Try to restore uploaded bytes from dashboard_state or cache directory
+    try:
+        if uploaded is None and "dashboard_state" in st.session_state:
+            ufiles = st.session_state["dashboard_state"].get("uploaded_files", {})
+            if ufiles and ufiles.get("ingest"):
+                data = ufiles["ingest"].get("data")
+                name = ufiles["ingest"].get("name")
+                if data:
+                    uploaded = io.BytesIO(data)
+                    uploaded.name = name or f"restored_{Path(name).name if name else 'upload'}.csv"
+    except Exception:
+        pass
+
     # Advanced options
     with st.expander("Options avancees", expanded=False):
         col1, col2 = st.columns(2)
@@ -83,10 +97,48 @@ def render_ingest_ui():
             )
 
     if uploaded is not None:
-        # Save temp file
-        tmp = Path(tempfile.gettempdir()) / f"uploaded_{uploaded.name}"
+        # Read bytes (uploaded may be a stream); save to dashboard_state and disk cache
+        try:
+            try:
+                uploaded.seek(0)
+            except Exception:
+                pass
+            data_bytes = uploaded.read()
+        except Exception:
+            data_bytes = None
+
+        # Persist in dashboard_state
+        try:
+            st.session_state.setdefault("dashboard_state", {}).setdefault("uploaded_files", {})["ingest"] = {
+                "name": getattr(uploaded, "name", "uploaded.csv"),
+                "data": data_bytes,
+            }
+        except Exception:
+            pass
+
+        # Also write durable copy to cache dir if available
+        try:
+            cache_dir = PROJECT_ROOT / "data" / "interim" / ".dashboard_cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            if data_bytes is not None:
+                cache_path = cache_dir / "ingest_uploaded.csv"
+                with open(cache_path, "wb") as _f:
+                    _f.write(data_bytes)
+        except Exception:
+            pass
+
+        # Save temp file for preview/ingestion
+        tmp = Path(tempfile.gettempdir()) / f"uploaded_{getattr(uploaded, 'name', 'upload')}"
         with open(tmp, "wb") as f:
-            shutil.copyfileobj(uploaded, f)
+            if data_bytes is not None:
+                f.write(data_bytes)
+            else:
+                # fallback: copy stream
+                try:
+                    uploaded.seek(0)
+                    shutil.copyfileobj(uploaded, f)
+                except Exception:
+                    pass
 
         # Preview uploaded file
         st.divider()
@@ -189,6 +241,15 @@ def render_ingest_ui():
                     st.success(f"Ingestion terminee avec succes ! Fichier ecrit : `{res}`")
                     try:
                         df_result = pd.read_csv(res)
+                        # cache parsed ingestion result for dashboard restore
+                        try:
+                            cache_dir = PROJECT_ROOT / "data" / "interim" / ".dashboard_cache"
+                            cache_dir.mkdir(parents=True, exist_ok=True)
+                            pkl = cache_dir / f"ingest_{Path(res).stem}.pkl"
+                            df_result.to_pickle(pkl)
+                            st.session_state.setdefault("dashboard_state", {}).setdefault("last_results", {})["ingest_df"] = str(pkl)
+                        except Exception:
+                            pass
                         st.subheader("Apercu du fichier ingere")
 
                         # Comparison stats

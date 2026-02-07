@@ -272,6 +272,59 @@ def format_number(n, decimals=0):
 
 
 # =====================================================================
+# INITIALIZE SESSION STATE
+# =====================================================================
+if "uploaded_file_name" not in st.session_state:
+    st.session_state["uploaded_file_name"] = None
+if "uploaded_file_data" not in st.session_state:
+    st.session_state["uploaded_file_data"] = None
+if "df_raw" not in st.session_state:
+    st.session_state["df_raw"] = None
+if "user_params" not in st.session_state:
+    st.session_state["user_params"] = {}
+
+# On-disk cache directory (helps persistence across hard reloads/restarts)
+CACHE_DIR = PROJECT_ROOT / "data" / "interim" / ".streamlit_cache"
+try:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    # Best-effort: if we cannot create the dir, keep running (session cache still works)
+    CACHE_DIR = None
+
+if "cache_paths" not in st.session_state:
+    st.session_state["cache_paths"] = {"uploaded": None, "df_raw": None}
+
+# Try to restore uploaded bytes from on-disk cache early so the sidebar uploader
+# can show the filename/status during the same run.
+try:
+    if st.session_state.get("uploaded_file_data") is None:
+        cache_candidate = None
+        # Prefer remembered path in session_state
+        cp = st.session_state.get("cache_paths", {}).get("uploaded")
+        if cp:
+            p = Path(cp)
+            if p.exists():
+                cache_candidate = p
+        # Otherwise detect default cache file
+        if cache_candidate is None and CACHE_DIR is not None:
+            p2 = CACHE_DIR / "uploaded_cache.csv"
+            if p2.exists():
+                cache_candidate = p2
+
+        if cache_candidate is not None:
+            try:
+                with open(cache_candidate, "rb") as f:
+                    data = f.read()
+                st.session_state["uploaded_file_data"] = data
+                # preserve original name if possible, else use cached filename
+                st.session_state["uploaded_file_name"] = st.session_state.get("uploaded_file_name") or cache_candidate.name
+                st.session_state["cache_paths"]["uploaded"] = str(cache_candidate)
+            except Exception:
+                pass
+except Exception:
+    pass
+
+# =====================================================================
 # SIDEBAR
 # =====================================================================
 
@@ -284,37 +337,137 @@ with st.sidebar:
         "Charger un fichier CSV",
         type=["csv"],
         help="Chargez vos donnees de vente au format CSV. Le fichier doit contenir au moins une colonne de date et une colonne numerique.",
+        key="csv_uploader",
     )
+    
+    # Store uploaded file in session state
+    if uploaded is not None:
+        # Check if it's a new file
+        if st.session_state["uploaded_file_name"] != uploaded.name:
+            st.session_state["uploaded_file_name"] = uploaded.name
+            # Read and store the file data
+            try:
+                uploaded.seek(0)
+            except Exception:
+                pass
+            st.session_state["uploaded_file_data"] = uploaded.read()
+            # Also write a durable copy to disk so a full reload (F5) can restore UI previews
+            try:
+                if CACHE_DIR is not None:
+                    cache_path = CACHE_DIR / "uploaded_cache.csv"
+                    with open(cache_path, "wb") as _f:
+                        _f.write(st.session_state["uploaded_file_data"])
+                    st.session_state["cache_paths"]["uploaded"] = str(cache_path)
+            except Exception:
+                # Non-fatal: keep session memory fallback
+                pass
+    
+    # Show currently loaded file
+    if st.session_state["uploaded_file_name"]:
+        st.success(f"📄 Fichier chargé: {st.session_state['uploaded_file_name']}")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Recharger", key="reload_file", use_container_width=True):
+                # Force reparse
+                st.session_state["df_raw"] = None
+                st.session_state["last_parsed_file"] = None
+                st.rerun()
+        with col2:
+            if st.button("🗑️ Effacer", key="clear_file", use_container_width=True):
+                st.session_state["uploaded_file_name"] = None
+                st.session_state["uploaded_file_data"] = None
+                st.session_state["df_raw"] = None
+                st.session_state["user_params"] = {}
+                # remove on-disk cache if present
+                try:
+                    last = st.session_state.get("cache_paths", {}).get("uploaded")
+                    if last and Path(last).exists():
+                        Path(last).unlink()
+                    p = st.session_state.get("cache_paths", {}).get("df_raw")
+                    if p and Path(p).exists():
+                        Path(p).unlink()
+                except Exception:
+                    pass
+                st.session_state["last_parsed_file"] = None
+                st.rerun()
 
     st.divider()
     st.markdown("### Parametres de prediction")
     horizon = st.slider(
-        "Horizon (jours)", 1, 365, 30,
+        "Horizon (jours)", 1, 365,
+        value=st.session_state["user_params"].get("horizon", 30),
         help="Nombre de jours a predire dans le futur",
+        key="horizon_slider",
     )
+    st.session_state["user_params"]["horizon"] = horizon
+    
     offline = st.checkbox(
         "Mode hors-ligne",
-        value=True,
+        value=st.session_state["user_params"].get("offline", True),
         help="Utiliser le modele local au lieu de l'API",
+        key="offline_check",
     )
+    st.session_state["user_params"]["offline"] = offline
+    
+    if not offline:
+        api_url_input = st.text_input(
+            "URL de l'API",
+            value=st.session_state["user_params"].get("api_url", os.getenv("API_URL", "http://localhost:8000")),
+            help="URL de l'API de prediction (par defaut: http://localhost:8000)",
+            key="api_url_sidebar",
+        )
+        st.session_state["api_url"] = api_url_input
+        st.session_state["user_params"]["api_url"] = api_url_input
 
     st.divider()
     st.markdown("### Options avancees")
     aggregate = st.checkbox(
         "Agreger les dates dupliquees (somme)",
-        value=True,
+        value=st.session_state["user_params"].get("aggregate", True),
         key="agg",
         help="Si plusieurs lignes ont la meme date, elles seront sommees",
     )
+    st.session_state["user_params"]["aggregate"] = aggregate
+    
     archive_outputs = st.checkbox(
         "Archiver les sorties",
-        value=False,
+        value=st.session_state["user_params"].get("archive_outputs", False),
         key="archive",
         help="Sauvegarder les resultats dans les dossiers du projet",
     )
+    st.session_state["user_params"]["archive_outputs"] = archive_outputs
+
+    st.divider()
+    st.markdown("### Options d'import (avancé)")
+    enc_options = ["Auto", "utf-8", "cp1252", "latin-1"]
+    enc_default = st.session_state["user_params"].get("encoding", "Auto")
+    encoding = st.selectbox(
+        "Encodage du fichier",
+        options=enc_options,
+        index=enc_options.index(enc_default) if enc_default in enc_options else 0,
+        help="Forcer l'encodage si la detection automatique echoue",
+        key="encoding_sel",
+    )
+    st.session_state["user_params"]["encoding"] = encoding
+
+    sep_options = ["Auto", ",", ";", "\t"]
+    sep_default = st.session_state["user_params"].get("sep_choice", "Auto")
+    sep_choice = st.selectbox(
+        "Separateur CSV",
+        options=sep_options,
+        index=sep_options.index(sep_default) if sep_default in sep_options else 0,
+        help="Forcer le separateur CSV (par defaut: Auto)",
+        key="sep_sel",
+    )
+    st.session_state["user_params"]["sep_choice"] = sep_choice
 
     st.divider()
     st.markdown("### Statut du modele")
+    
+    # Show persistence indicator
+    if st.session_state.get("df_raw") is not None:
+        st.info("💾 Données en cache")
+    
     if get_model_path:
         try:
             mp = get_model_path()
@@ -340,7 +493,20 @@ with st.sidebar:
 # LANDING PAGE (no file uploaded)
 # =====================================================================
 
-if uploaded is None:
+# Use file from session state if available
+if uploaded is None and st.session_state["uploaded_file_data"] is not None:
+    # Reconstruct the uploaded file from session state
+    uploaded = io.BytesIO(st.session_state["uploaded_file_data"])
+    uploaded.name = st.session_state["uploaded_file_name"]
+    # Add seek method if not present
+    if not hasattr(uploaded, 'seek'):
+        uploaded.seek = lambda pos: None
+
+# NOTE: uploaded restoration happens earlier (before sidebar) to allow
+# the uploader UI to reflect the cached filename/status. This block
+# intentionally left empty to avoid double-restoration.
+
+if uploaded is None and st.session_state["uploaded_file_data"] is None:
     st.title("Bienvenue sur le Dashboard de Prediction de Vente")
 
     st.markdown("""
@@ -433,56 +599,123 @@ if uploaded is None:
 # ---------------------------------------------------------------------------
 # Load data (robust to different delimiters)
 # ---------------------------------------------------------------------------
-try:
-    # Read whole upload (stream may be bytes or text)
+# Try to restore parsed DataFrame from disk cache when session memory is empty
+if st.session_state.get("df_raw") is None:
     try:
-        uploaded.seek(0)
+        df_cache_path = st.session_state.get("cache_paths", {}).get("df_raw")
+        if df_cache_path and Path(df_cache_path).exists():
+            try:
+                st.session_state["df_raw"] = pd.read_pickle(df_cache_path)
+                st.session_state["last_parsed_file"] = st.session_state.get("uploaded_file_name")
+            except Exception:
+                # try CSV fallback
+                try:
+                    st.session_state["df_raw"] = pd.read_csv(df_cache_path)
+                    st.session_state["last_parsed_file"] = st.session_state.get("uploaded_file_name")
+                except Exception:
+                    pass
+        elif CACHE_DIR is not None:
+            p = CACHE_DIR / "df_raw.pkl"
+            if p.exists():
+                try:
+                    st.session_state["df_raw"] = pd.read_pickle(p)
+                    st.session_state["last_parsed_file"] = st.session_state.get("uploaded_file_name")
+                    st.session_state["cache_paths"]["df_raw"] = str(p)
+                except Exception:
+                    # CSV fallback
+                    p2 = CACHE_DIR / "df_raw_fallback.csv"
+                    if p2.exists():
+                        try:
+                            st.session_state["df_raw"] = pd.read_csv(p2)
+                            st.session_state["last_parsed_file"] = st.session_state.get("uploaded_file_name")
+                            st.session_state["cache_paths"]["df_raw"] = str(p2)
+                        except Exception:
+                            pass
     except Exception:
         pass
-    raw = uploaded.read()
-
-    # Prepare a sample text for delimiter sniffing
-    if isinstance(raw, bytes):
-        sample_text = raw[:8192].decode("utf-8", errors="ignore")
-    else:
-        sample_text = str(raw)[:8192]
-
-    # Detect delimiter
+# Check if we already have parsed data in session state AND file hasn't changed
+if (st.session_state["df_raw"] is not None and 
+    st.session_state.get("last_parsed_file") == st.session_state.get("uploaded_file_name")):
+    df_raw = st.session_state["df_raw"]
+else:
     try:
-        dialect = csv.Sniffer().sniff(sample_text)
-        sep = dialect.delimiter
-    except Exception:
-        sep = ';' if ';' in sample_text and sample_text.count(';') > sample_text.count(',') else ','
-
-    # Try common encodings if pandas raises decoding error
-    encodings_to_try = [None, "utf-8", "cp1252", "latin-1"]
-    df_raw = None
-    for enc in encodings_to_try:
+        # Read whole upload (stream may be bytes or text)
         try:
-            if isinstance(raw, bytes):
-                # Use BytesIO and pass encoding when not None
-                bio = io.BytesIO(raw)
-                if enc:
-                    df_raw = pd.read_csv(bio, sep=sep, encoding=enc)
-                else:
-                    df_raw = pd.read_csv(bio, sep=sep)
-            else:
-                # raw is str
-                s = io.StringIO(raw)
-                df_raw = pd.read_csv(s, sep=sep)
-            break
-        except UnicodeDecodeError:
-            continue
+            uploaded.seek(0)
         except Exception:
-            # If parsing fails for other reasons, keep trying encodings
-            continue
+            pass
+        raw = uploaded.read()
 
-    if df_raw is None:
-        raise ValueError("Impossible de decoder/parse le fichier CSV avec les encodages tries")
-except Exception as e:
-    st.error(f"Erreur de lecture du CSV : {e}")
-    st.stop()
+        # Prepare a sample text for delimiter sniffing
+        if isinstance(raw, bytes):
+            sample_text = raw[:8192].decode("utf-8", errors="ignore")
+        else:
+            sample_text = str(raw)[:8192]
 
+        # Determine separator (allow user override)
+        if 'sep_choice' in globals() and sep_choice and sep_choice != "Auto":
+            sep = '\t' if sep_choice == "\t" else sep_choice
+        else:
+            try:
+                dialect = csv.Sniffer().sniff(sample_text)
+                sep = dialect.delimiter
+            except Exception:
+                sep = ';' if ';' in sample_text and sample_text.count(';') > sample_text.count(',') else ','
+
+        # Try encodings (allow user override)
+        if 'encoding' in globals() and encoding and encoding != "Auto":
+            encodings_to_try = [encoding]
+        else:
+            encodings_to_try = [None, "utf-8", "cp1252", "latin-1"]
+        df_raw = None
+        for enc in encodings_to_try:
+            try:
+                if isinstance(raw, bytes):
+                    # Use BytesIO and pass encoding when not None
+                    bio = io.BytesIO(raw)
+                    if enc:
+                        df_raw = pd.read_csv(bio, sep=sep, encoding=enc)
+                    else:
+                        df_raw = pd.read_csv(bio, sep=sep)
+                else:
+                    # raw is str
+                    s = io.StringIO(raw)
+                    df_raw = pd.read_csv(s, sep=sep)
+                break
+            except UnicodeDecodeError:
+                continue
+            except Exception:
+                # If parsing fails for other reasons, keep trying encodings
+                continue
+
+        if df_raw is None:
+            raise ValueError("Impossible de decoder/parse le fichier CSV avec les encodages tries")
+        
+        # Store in session state for persistence
+        st.session_state["df_raw"] = df_raw
+        st.session_state["last_parsed_file"] = st.session_state.get("uploaded_file_name")
+        # Also persist parsed DataFrame to disk for durable reloads
+        try:
+            if CACHE_DIR is not None:
+                df_cache = CACHE_DIR / "df_raw.pkl"
+                try:
+                    df_raw.to_pickle(df_cache)
+                    st.session_state["cache_paths"]["df_raw"] = str(df_cache)
+                except Exception:
+                    # fallback: try to write csv if pickle fails
+                    csv_cache = CACHE_DIR / "df_raw_fallback.csv"
+                    try:
+                        df_raw.to_csv(csv_cache, index=False)
+                        st.session_state["cache_paths"]["df_raw"] = str(csv_cache)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    except Exception as e:
+        st.error(f"Erreur lors de la lecture du fichier CSV: {e}")
+        st.stop()
+
+# Check if dataframe is empty
 if df_raw.empty:
     st.error("Le fichier CSV est vide.")
     st.stop()
@@ -496,43 +729,54 @@ detected_date, detected_value = detect_columns(df_raw)
 with st.sidebar:
     st.divider()
     st.markdown("### Colonnes detectees")
+    
+    # Get saved column selections or use detected ones
+    saved_date_col = st.session_state["user_params"].get("date_col", detected_date)
     date_col = st.selectbox(
         "Colonne de date",
         options=df_raw.columns.tolist(),
-        index=df_raw.columns.tolist().index(detected_date) if detected_date in df_raw.columns else 0,
+        index=df_raw.columns.tolist().index(saved_date_col) if saved_date_col in df_raw.columns else 0,
         key="date_col_sel",
     )
+    st.session_state["user_params"]["date_col"] = date_col
 
     numeric_cols = df_raw.select_dtypes(include=["number"]).columns.tolist()
-    value_default = detected_value or (numeric_cols[0] if numeric_cols else df_raw.columns[0])
+    value_default = st.session_state["user_params"].get("value_col") or detected_value or (numeric_cols[0] if numeric_cols else df_raw.columns[0])
     value_col = st.selectbox(
         "Colonne de valeur",
         options=numeric_cols if numeric_cols else df_raw.columns.tolist(),
         index=numeric_cols.index(value_default) if value_default in numeric_cols else 0,
         key="value_col_sel",
     )
+    st.session_state["user_params"]["value_col"] = value_col
 
     # Group column
     cat_cols = [c for c in df_raw.select_dtypes(include=["object", "category"]).columns if c != date_col]
     if cat_cols:
+        saved_group_col = st.session_state["user_params"].get("group_col", "Aucun")
+        group_options = ["Aucun"] + cat_cols
         group_col = st.selectbox(
             "Colonne de regroupement",
-            options=["Aucun"] + cat_cols,
-            index=0,
+            options=group_options,
+            index=group_options.index(saved_group_col) if saved_group_col in group_options else 0,
             key="group_col_sel",
         )
+        st.session_state["user_params"]["group_col"] = group_col
     else:
         group_col = "Aucun"
 
     group_filter = "Tous"
     if group_col != "Aucun":
         unique_vals = sorted(df_raw[group_col].dropna().astype(str).unique().tolist())
+        saved_filter = st.session_state["user_params"].get("group_filter", "Tous")
+        filter_options = ["Tous"] + unique_vals
         group_filter = st.selectbox(
             "Filtrer par groupe",
-            options=["Tous"] + unique_vals,
-            index=0,
+            options=filter_options,
+            index=filter_options.index(saved_filter) if saved_filter in filter_options else 0,
             key="group_filter_sel",
         )
+        st.session_state["user_params"]["group_filter"] = group_filter
 
 
 # ---------------------------------------------------------------------------

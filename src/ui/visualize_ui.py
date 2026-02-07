@@ -14,6 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
+import io
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -91,13 +92,48 @@ def render_visualize_ui():
         help="CSV contenant au moins une colonne de date et une colonne de prediction (yhat/forecast)",
     )
 
+    # Restore uploaded from dashboard_state cache if available
+    try:
+        if uploaded is None and "dashboard_state" in st.session_state:
+            ufiles = st.session_state["dashboard_state"].get("uploaded_files", {})
+            if ufiles and ufiles.get("visualize"):
+                data = ufiles["visualize"].get("data")
+                name = ufiles["visualize"].get("name")
+                if data:
+                    uploaded = io.BytesIO(data)
+                    uploaded.name = name or "restored_visualize.csv"
+    except Exception:
+        pass
+
     df = None
     loaded_from = None
 
     if uploaded is not None:
         try:
-            df = pd.read_csv(uploaded)
-            loaded_from = f"upload: {uploaded.name}"
+            try:
+                uploaded.seek(0)
+            except Exception:
+                pass
+            data_bytes = uploaded.read()
+            # Persist in dashboard_state and durable cache
+            try:
+                st.session_state.setdefault("dashboard_state", {}).setdefault("uploaded_files", {})["visualize"] = {
+                    "name": getattr(uploaded, "name", "visualize.csv"),
+                    "data": data_bytes,
+                }
+            except Exception:
+                pass
+            try:
+                cache_dir = PROJECT_ROOT / "data" / "interim" / ".dashboard_cache"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                if data_bytes is not None:
+                    with open(cache_dir / "visualize_uploaded.csv", "wb") as _f:
+                        _f.write(data_bytes)
+            except Exception:
+                pass
+
+            df = pd.read_csv(io.BytesIO(data_bytes) if data_bytes is not None else uploaded)
+            loaded_from = f"upload: {getattr(uploaded, 'name', '')}"
         except Exception as e:
             st.error(f"Impossible de lire le CSV : {e}")
             return
@@ -122,6 +158,22 @@ def render_visualize_ui():
                 "Executez la prediction ou chargez un fichier CSV."
             )
             return
+
+    if df is None:
+        # Fallback: try to restore cached parsed forecast dataframe
+        try:
+            last = st.session_state.get("dashboard_state", {}).get("last_results", {})
+            p = last.get("visualize_df")
+            if p:
+                try:
+                    df = pd.read_pickle(p)
+                except Exception:
+                    try:
+                        df = pd.read_csv(p)
+                    except Exception:
+                        df = None
+        except Exception:
+            df = None
 
     if df is None:
         return
@@ -184,9 +236,44 @@ def render_visualize_ui():
             type=["csv"],
             key="hist_upload",
         )
+        # Try to restore uploaded historical from dashboard_state cache
+        try:
+            if uploaded_hist is None and "dashboard_state" in st.session_state:
+                ufiles = st.session_state["dashboard_state"].get("uploaded_files", {})
+                if ufiles and ufiles.get("visualize_hist"):
+                    data = ufiles["visualize_hist"].get("data")
+                    name = ufiles["visualize_hist"].get("name")
+                    if data:
+                        uploaded_hist = io.BytesIO(data)
+                        uploaded_hist.name = name or "restored_hist.csv"
+        except Exception:
+            pass
+
         if uploaded_hist is not None:
             try:
-                hist_df = pd.read_csv(uploaded_hist)
+                try:
+                    uploaded_hist.seek(0)
+                except Exception:
+                    pass
+                hist_bytes = uploaded_hist.read()
+                # persist
+                try:
+                    st.session_state.setdefault("dashboard_state", {}).setdefault("uploaded_files", {})["visualize_hist"] = {
+                        "name": getattr(uploaded_hist, "name", "hist.csv"),
+                        "data": hist_bytes,
+                    }
+                except Exception:
+                    pass
+                try:
+                    cache_dir = PROJECT_ROOT / "data" / "interim" / ".dashboard_cache"
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    if hist_bytes is not None:
+                        with open(cache_dir / "visualize_hist_uploaded.csv", "wb") as _f:
+                            _f.write(hist_bytes)
+                except Exception:
+                    pass
+
+                hist_df = pd.read_csv(io.BytesIO(hist_bytes) if hist_bytes is not None else uploaded_hist)
                 # detect date column in the uploaded historical file and normalize to 'ds'
                 try:
                     hist_df, hist_date = _normalize_date_column(hist_df)
