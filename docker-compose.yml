@@ -1,3 +1,6 @@
+# Train runs on startup if no model exists (creates models/artifacts/model_*_baseline.pkl).
+# Now uses improved training with bias correction and better validation.
+# Ensure data/processed/sample_features.csv exists (run features pipeline or copy sample data).
 services:
   api:
     build: .
@@ -6,9 +9,15 @@ services:
       - "8000:8000"
     environment:
       - PYTHONPATH=/app
+      - MODELS_ARTIFACTS_DIR=/app/models/artifacts
     volumes:
       - ./:/app:cached
-    command: uvicorn src.serve.api:app --host 0.0.0.0 --port 8000
+    command: >
+      sh -c "
+        (find /app/models/artifacts -maxdepth 1 -name 'model_*_improved.pkl' 2>/dev/null | grep -q .) ||
+        (python -m src.models.improved_train --tag improved || true);
+        exec uvicorn src.serve.api:app --host 0.0.0.0 --port 8000
+      "
 
   streamlit:
     build: .
@@ -17,10 +26,15 @@ services:
       - "8501:8501"
     environment:
       - PYTHONPATH=/app
+      - MODELS_ARTIFACTS_DIR=/app/models/artifacts
     volumes:
       - ./:/app:cached
-    command: streamlit run src/ui/dashboard.py --server.port 8501 --server.address 0.0.0.0
-
+    command: >
+      sh -c "
+        (find /app/models/artifacts -maxdepth 1 -name 'model_*_baseline.pkl' 2>/dev/null | grep -q .) ||
+        (python -m src.models.train || true);
+        exec streamlit run src/ui/dashboard.py --server.port 8501 --server.address 0.0.0.0
+      "
 
   streamlit_admin:
     build: .
@@ -29,6 +43,12 @@ services:
       - "8502:8502"
     environment:
       - PYTHONPATH=/app
+      - MODELS_ARTIFACTS_DIR=/app/models/artifacts
     volumes:
       - ./:/app:cached
-    command: streamlit run src/ui/streamlit_app.py --server.port 8502 --server.address 0.0.0.0
+    command: >
+      sh -c "
+        (find /app/models/artifacts -maxdepth 1 -name 'model_*_baseline.pkl' 2>/dev/null | grep -q .) ||
+        (python -m src.models.train || true);
+        exec streamlit run src/ui/streamlit_app.py --server.port 8502 --server.address 0.0.0.0
+      "

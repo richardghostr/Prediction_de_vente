@@ -27,6 +27,12 @@ ARCHIVE_DIR = ROOT / "archive"
 # Reproducibility
 RANDOM_SEED = 42
 
+# Feature config (must match between train and predict)
+PREDICT_LAGS = [1, 7, 14]
+PREDICT_WINDOWS = [7, 14]
+# Columns to exclude from model features (identifiers / targets that don't generalize at inference)
+FEATURE_EXCLUDE = {"value", "date", "id", "product_id", "category", "revenue", "unit_price", "on_promo"}
+
 # Date formatting
 DATE_FORMAT = "%Y-%m-%d"
 

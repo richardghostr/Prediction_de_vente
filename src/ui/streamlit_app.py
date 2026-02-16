@@ -1388,6 +1388,20 @@ with tab_predict:
         # Results
         st.success(f"Prediction terminee : {len(fc)} points generes")
 
+        # Method and warning (why forecast might be flat) — from direct result or API model_info
+        model_info = forecast_result.get("model_info") or {}
+        method = forecast_result.get("method") or model_info.get("method", "unknown")
+        warning = forecast_result.get("warning") or model_info.get("warning")
+        if method == "naive":
+            st.warning(
+                "**Prediction naive (valeur repetee)** : aucun modele entraine trouve. "
+                "Pour des previsions variables, exécutez d'abord : `python -m src.models.train`"
+            )
+        elif warning:
+            st.warning(warning)
+        if method == "xgboost" and not warning:
+            st.caption("Modele XGBoost utilise (previsions variables).")
+
         # Metrics (if available)
         if forecast_result.get("metrics"):
             st.subheader("Metriques du modele")
