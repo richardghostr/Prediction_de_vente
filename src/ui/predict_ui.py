@@ -190,6 +190,18 @@ def display_forecast_results(
 
     fc["ds"] = pd.to_datetime(fc["ds"])
 
+    # Method and warning (why forecast might be flat)
+    model_info = forecast_result.get("model_info") or {}
+    method = forecast_result.get("method") or model_info.get("method", "unknown")
+    warning = forecast_result.get("warning") or model_info.get("warning")
+    if method == "naive":
+        st.warning(
+            "**Prediction naive (valeur repetee)** : aucun modele entraine trouve. "
+            "Executez : `python -m src.models.train` pour des previsions variables."
+        )
+    elif warning:
+        st.warning(warning)
+
     # Metrics
     if forecast_result.get("metrics"):
         st.subheader("Metriques du modele")

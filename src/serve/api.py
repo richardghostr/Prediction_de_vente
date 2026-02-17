@@ -115,12 +115,16 @@ def _predict_single(request: SeriesRequest, horizon: int) -> ForecastResponse:
     if PREDICT_MODULE and hasattr(PREDICT_MODULE, "predict_series"):
         try:
             result = PREDICT_MODULE.predict_series(series_payload, horizon=horizon)
-            # Gather model info
+            # Gather model info (include method and warning from predict_series)
+            method = result.get("method", "xgboost")
+            warning = result.get("warning")
             try:
                 mp = PREDICT_MODULE.get_model_path()
-                model_info = {"model_path": mp, "method": "xgboost"}
+                model_info = {"model_path": mp, "method": method}
             except Exception:
-                model_info = {"method": "xgboost"}
+                model_info = {"method": method}
+            if warning:
+                model_info["warning"] = warning
         except FileNotFoundError as e:
             logger.warning("Model artifact not found, falling back to naive: %s", e)
         except Exception as e:
