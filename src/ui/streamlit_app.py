@@ -264,6 +264,63 @@ def prepare_time_series(
     return ts
 
 
+def build_series_from_df(
+    df: pd.DataFrame,
+    date_col: str = "date",
+    value_col: str = "value",
+    id_col: str = None,
+):
+    """Build a list of datapoints suitable for the API / predict_series.
+
+    Mirrors the logic used in `predict_ui.py` so the payload format is identical.
+    Returns (series, series_id, agg_info).
+    """
+    df2 = df.copy()
+    if date_col not in df2.columns:
+        raise ValueError(f"Colonne de date manquante : {date_col}")
+    df2[date_col] = pd.to_datetime(df2[date_col])
+
+    series_id = None
+    if id_col and id_col in df2.columns:
+        uniq = df2[id_col].dropna().unique()
+        if len(uniq) == 1:
+            series_id = str(uniq[0])
+
+    agg_dict = {}
+    for c in df2.columns:
+        if c in (date_col, id_col):
+            continue
+        if pd.api.types.is_numeric_dtype(df2[c]):
+            agg_dict[c] = "sum"
+        else:
+            agg_dict[c] = "first"
+
+    grouped = df2.groupby(df2[date_col].dt.floor("D")).agg(agg_dict).reset_index()
+    grouped = grouped.sort_values(by=date_col)
+
+    series = []
+    for _, row in grouped.iterrows():
+        item = {"date": pd.to_datetime(row[date_col]).date().isoformat()}
+        if value_col in grouped.columns:
+            val = row[value_col]
+            item["value"] = None if pd.isna(val) else float(val)
+        for c in grouped.columns:
+            if c in (date_col, value_col):
+                continue
+            v = row[c]
+            if pd.isna(v):
+                continue
+            item[c] = float(v) if isinstance(v, (int, float)) else str(v)
+        series.append(item)
+
+    agg_info = {
+        "original_rows": len(df2),
+        "unique_dates": int(df2[date_col].dt.floor("D").nunique()),
+        "aggregated_rows": len(grouped),
+    }
+    return series, series_id, agg_info
+
+
 def format_number(n, decimals=0):
     """Format a number with thousands separator."""
     if decimals == 0:
@@ -1302,30 +1359,75 @@ with tab_predict:
     )
 
     if st.button("Lancer la prediction", type="primary", use_container_width=True):
-        # Build series payload from cleaned data
-        series_payload = []
-        for _, row in df_clean.iterrows():
+        # Build series payload using the shared helper (same logic as predict_ui)
+        try:
+            # Coerce value column to numeric before building series
             try:
-                ds = pd.to_datetime(row[date_col])
-                date_iso = ds.date().isoformat()
+                df_clean[value_col] = pd.to_numeric(df_clean[value_col], errors="coerce")
             except Exception:
-                date_iso = str(row[date_col])
-            item = {"date": date_iso}
-            if value_col in df_clean.columns:
-                val = row[value_col]
-                item["value"] = None if pd.isna(val) else float(val)
-            for c in df_clean.select_dtypes(include=["number"]).columns:
-                if c != value_col and pd.notna(row[c]):
-                    item[c] = float(row[c])
-            series_payload.append(item)
+                pass
 
+            series_payload, series_id, agg_info = build_series_from_df(
+                df_clean, date_col=date_col, value_col=value_col
+            )
+            st.caption(f"Aggregation: rows={agg_info['original_rows']}, unique_dates={agg_info['unique_dates']}, aggregated_rows={agg_info['aggregated_rows']}")
+        except Exception as e:
+            st.warning(f"Construction du payload a echoue ({e}), tentative en ligne par ligne.")
+            series_payload = []
+            for _, row in df_clean.iterrows():
+                try:
+                    ds = pd.to_datetime(row[date_col])
+                    date_iso = ds.date().isoformat()
+                except Exception:
+                    date_iso = str(row[date_col])
+                item = {"date": date_iso}
+                if value_col in df_clean.columns:
+                    val = row[value_col]
+                    item["value"] = None if pd.isna(val) else float(val)
+                for c in df_clean.select_dtypes(include=["number"]).columns:
+                    if c != value_col and pd.notna(row[c]):
+                        item[c] = float(row[c])
+                series_payload.append(item)
+
+        # Diagnostic: show series payload stats to help debug zero predictions
+        try:
+            vals = [it.get("value") for it in series_payload]
+            non_null = [v for v in vals if v is not None]
+            st.caption(f"Payload points: {len(series_payload)}, non-null values: {len(non_null)}")
+            if len(non_null) == 0:
+                st.warning("Aucun valeur numerique disponible dans le payload de prediction. Verifiez la colonne choisie.")
+            else:
+                try:
+                    st.caption(f"Valeurs (min/max/mean): {min(non_null):.3f} / {max(non_null):.3f} / {sum(non_null)/len(non_null):.3f}")
+                except Exception:
+                    pass
+            # show first items for inspection
+            try:
+                st.write("Extrait du payload:", series_payload[:5])
+            except Exception:
+                pass
+        except Exception:
+            pass
         forecast_result = None
 
         if offline:
             with st.spinner("Prediction en cours (mode hors-ligne)..."):
-                if predict_series is not None:
+                # Try to ensure `predict_series` is available. The module-level import
+                # may have failed earlier (graceful degradation). Attempt a dynamic
+                # import as a fallback so the local model can still be used when
+                # available instead of always falling back to the naive predictor.
+                local_predict = predict_series
+                if local_predict is None:
                     try:
-                        forecast_result = predict_series(series_payload, horizon=horizon)
+                        import importlib
+                        mod = importlib.import_module("src.models.predict")
+                        local_predict = getattr(mod, "predict_series", None)
+                    except Exception:
+                        local_predict = None
+
+                if local_predict is not None:
+                    try:
+                        forecast_result = local_predict(series_payload, horizon=horizon)
                     except Exception as e:
                         st.warning(f"Modele local echoue : {e}. Utilisation du repli naive.")
 
@@ -1367,6 +1469,17 @@ with tab_predict:
 
         # Parse forecast
         fc = pd.DataFrame(forecast_result.get("forecast", []))
+        # Robust: accept either 'yhat' or 'y' as forecast column and coerce to numeric
+        try:
+            if "yhat" not in fc.columns and "y" in fc.columns:
+                fc = fc.rename(columns={"y": "yhat"})
+        except Exception:
+            pass
+        try:
+            if "yhat" in fc.columns:
+                fc["yhat"] = pd.to_numeric(fc["yhat"], errors="coerce")
+        except Exception:
+            pass
         if fc.empty:
             st.warning("La prediction n'a retourne aucun resultat.")
             st.stop()
