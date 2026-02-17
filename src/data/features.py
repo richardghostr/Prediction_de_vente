@@ -10,6 +10,7 @@ Exemple d'utilisation :
 
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -21,6 +22,13 @@ def add_time_features(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
     df["day"] = df[date_col].dt.day
     df["dayofweek"] = df[date_col].dt.dayofweek
     df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)
+    df["quarter"] = df[date_col].dt.quarter
+    df["week_of_year"] = df[date_col].dt.isocalendar().week.astype(int)
+    # Cyclical encoding for month (helps model capture periodicity)
+    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
+    df["dow_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7)
+    df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
     return df
 
 
@@ -52,8 +60,13 @@ def add_rolling_features(
     # IMPORTANT: shift(1) to avoid data leakage - rolling stats must use only past values
     shifted = df[value_col].shift(1)
     for w in windows:
-        df[f"roll_mean_{w}"] = shifted.rolling(window=w, min_periods=w).mean()
-        df[f"roll_std_{w}"] = shifted.rolling(window=w, min_periods=w).std().fillna(0)
+        # Use min_periods=1 so we don't lose too many rows on small datasets,
+        # while still requiring at least 1 past observation
+        df[f"roll_mean_{w}"] = shifted.rolling(window=w, min_periods=1).mean()
+        df[f"roll_std_{w}"] = shifted.rolling(window=w, min_periods=1).std().fillna(0)
+        # Add rolling min/max for better range capture
+        df[f"roll_min_{w}"] = shifted.rolling(window=w, min_periods=1).min()
+        df[f"roll_max_{w}"] = shifted.rolling(window=w, min_periods=1).max()
     return df
 
 

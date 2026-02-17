@@ -53,12 +53,18 @@ def _parse_int_list(s: str) -> List[int]:
 
 def _pipeline_feature_columns(lags: List[int], windows: List[int]) -> set:
     """Column names produced by build_feature_pipeline for given lags/windows (so train and predict match)."""
-    base = {"date", "value", "year", "month", "day", "dayofweek", "is_weekend"}
+    base = {
+        "date", "value", "year", "month", "day", "dayofweek", "is_weekend",
+        "quarter", "week_of_year",
+        "month_sin", "month_cos", "dow_sin", "dow_cos",
+    }
     lag_cols = {f"lag_{l}" for l in lags}
     roll_cols = set()
     for w in windows:
         roll_cols.add(f"roll_mean_{w}")
         roll_cols.add(f"roll_std_{w}")
+        roll_cols.add(f"roll_min_{w}")
+        roll_cols.add(f"roll_max_{w}")
     return base | lag_cols | roll_cols
 
 
@@ -105,12 +111,12 @@ def split_time_series(
     exclude_cols = set(exclude_cols) | {target_col, date_col}
     feature_cols = [c for c in df.columns if c not in exclude_cols]
 
-    X = df[feature_cols]
-    y = df[target_col]
+    X = df[feature_cols].copy()
+    y = df[target_col].copy()
 
-    X_train, X_test = X.iloc[:-horizon], X.iloc[-horizon:]
-    y_train, y_test = y.iloc[:-horizon], y.iloc[-horizon:]
-    dates_test = df[date_col].iloc[-horizon:]
+    X_train, X_test = X.iloc[:-horizon].copy(), X.iloc[-horizon:].copy()
+    y_train, y_test = y.iloc[:-horizon].copy(), y.iloc[-horizon:].copy()
+    dates_test = df[date_col].iloc[-horizon:].copy()
 
     return X_train, y_train, X_test, y_test, dates_test
 
@@ -119,19 +125,34 @@ def train_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     n_estimators: int = 200,
-    max_depth: int = 4,
-    learning_rate: float = 0.1,
-    reg_alpha: float = 0.1,
-    reg_lambda: float = 1.0,
+    max_depth: int = 3,
+    learning_rate: float = 0.05,
+    reg_alpha: float = 1.0,
+    reg_lambda: float = 5.0,
+    subsample: float = 0.8,
+    colsample_bytree: float = 0.8,
+    min_child_weight: int = 5,
     random_state: int = 42,
 ) -> XGBRegressor:
-    """Train an XGBRegressor on the provided data with regularization to reduce overfitting."""
+    """Train an XGBRegressor with stronger regularization to reduce overfitting.
+
+    Key anti-overfitting measures:
+    - Lower max_depth (3 vs 4) to limit tree complexity
+    - Lower learning_rate (0.05 vs 0.1) for smoother convergence
+    - Higher reg_alpha/reg_lambda for L1/L2 regularization
+    - subsample < 1.0 for stochastic training (bagging effect)
+    - colsample_bytree < 1.0 for feature subsampling
+    - min_child_weight > 1 to prevent splits on small leaf nodes
+    """
     model = XGBRegressor(
         n_estimators=n_estimators,
         max_depth=max_depth,
         learning_rate=learning_rate,
         reg_alpha=reg_alpha,
         reg_lambda=reg_lambda,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        min_child_weight=min_child_weight,
         random_state=random_state,
     )
     model.fit(X_train, y_train)
@@ -254,10 +275,13 @@ def main(argv=None) -> int:
     parser.add_argument("--windows", default=None, help=f"Comma-separated rolling window sizes (default: {PREDICT_WINDOWS})")
     parser.add_argument("--horizon", type=int, default=30, help="Test horizon in days (default: 30)")
     parser.add_argument("--n-estimators", type=int, default=200, help="Number of XGBoost estimators (default: 200)")
-    parser.add_argument("--max-depth", type=int, default=4, help="Max tree depth (default: 4)")
-    parser.add_argument("--learning-rate", type=float, default=0.1, help="Learning rate (default: 0.1)")
-    parser.add_argument("--reg-alpha", type=float, default=0.1, help="L1 regularization (default: 0.1)")
-    parser.add_argument("--reg-lambda", type=float, default=1.0, help="L2 regularization (default: 1.0)")
+    parser.add_argument("--max-depth", type=int, default=3, help="Max tree depth (default: 3, reduced to prevent overfitting)")
+    parser.add_argument("--learning-rate", type=float, default=0.05, help="Learning rate (default: 0.05)")
+    parser.add_argument("--reg-alpha", type=float, default=1.0, help="L1 regularization (default: 1.0)")
+    parser.add_argument("--reg-lambda", type=float, default=5.0, help="L2 regularization (default: 5.0)")
+    parser.add_argument("--subsample", type=float, default=0.8, help="Row subsampling ratio (default: 0.8)")
+    parser.add_argument("--colsample-bytree", type=float, default=0.8, help="Feature subsampling ratio (default: 0.8)")
+    parser.add_argument("--min-child-weight", type=int, default=5, help="Min child weight (default: 5)")
     parser.add_argument("--tag", default="baseline", help="Model tag for file naming (default: baseline)")
     args = parser.parse_args(argv)
 
@@ -289,7 +313,7 @@ def main(argv=None) -> int:
     X_all = df[feature_cols]
     y_all = df["value"]
 
-    # Train with regularization to reduce overfitting
+    # Train with strong regularization to reduce overfitting
     model = train_model(
         X_train, y_train,
         n_estimators=args.n_estimators,
@@ -297,6 +321,9 @@ def main(argv=None) -> int:
         learning_rate=args.learning_rate,
         reg_alpha=args.reg_alpha,
         reg_lambda=args.reg_lambda,
+        subsample=args.subsample,
+        colsample_bytree=args.colsample_bytree,
+        min_child_weight=args.min_child_weight,
     )
 
     # Evaluate

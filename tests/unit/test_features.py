@@ -36,10 +36,18 @@ def test_lags_and_rolling():
     feat = features.build_feature_pipeline(cleaned, date_col="date", value_col="value", lags=[1, 2], windows=[3])
     # lags created
     assert "lag_1" in feat.columns and "lag_2" in feat.columns
-    # rolling mean created
+    # rolling mean/std/min/max created
     assert "roll_mean_3" in feat.columns
+    assert "roll_std_3" in feat.columns
+    assert "roll_min_3" in feat.columns
+    assert "roll_max_3" in feat.columns
     # time features
     assert "dayofweek" in feat.columns and "is_weekend" in feat.columns
+    # new seasonal features
+    assert "quarter" in feat.columns
+    assert "week_of_year" in feat.columns
+    assert "month_sin" in feat.columns
+    assert "month_cos" in feat.columns
 
 
 def test_encode_categorical():

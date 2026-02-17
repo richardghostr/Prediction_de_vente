@@ -166,10 +166,10 @@ def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
         return X
 
     X = X.copy()
-    # Add missing columns with zeros
+    # Add missing columns with zeros (using .loc to avoid SettingWithCopyWarning)
     for col in expected:
         if col not in X.columns:
-            X[col] = 0
+            X.loc[:, col] = 0
     # Drop unexpected columns
     extra = [c for c in X.columns if c not in expected]
     if extra:
