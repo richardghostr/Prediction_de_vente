@@ -196,7 +196,7 @@ def render_features_ui():
 
         try:
             with st.spinner("Generation des features en cours..."):
-                feat = build_feature_pipeline(
+                feat, _ = build_feature_pipeline(
                     df,
                     date_col=date_col,
                     value_col=value_col,

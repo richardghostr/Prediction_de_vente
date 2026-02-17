@@ -863,7 +863,7 @@ else:
 features_df = None
 if build_feature_pipeline:
     try:
-        features_df = build_feature_pipeline(
+        features_df, _ = build_feature_pipeline(
             df_clean, date_col=date_col, value_col=value_col,
             lags=[1, 7], windows=[3, 7],
         )

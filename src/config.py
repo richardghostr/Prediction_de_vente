@@ -30,8 +30,20 @@ RANDOM_SEED = 42
 # Feature config (must match between train and predict)
 PREDICT_LAGS = [1, 7, 14]
 PREDICT_WINDOWS = [7, 14]
-# Columns to exclude from model features (identifiers / targets that don't generalize at inference)
-FEATURE_EXCLUDE = {"value", "date", "id", "product_id", "category", "revenue", "unit_price", "on_promo"}
+
+# Group columns: each unique (store, product) combination is a separate time series.
+# Lags and rolling features MUST be computed within each group to avoid data leakage.
+GROUP_COLS = ["store_id", "product_id"]
+
+# Columns that are label-encoded and used as model features
+CATEGORICAL_FEATURES = ["store_id", "product_id"]
+
+# Binary features kept as-is
+BINARY_FEATURES = ["on_promo"]
+
+# Columns to exclude from model features (identifiers / targets that would cause leakage)
+# NOTE: store_id and product_id are ENCODED separately, their raw text is excluded here.
+FEATURE_EXCLUDE = {"value", "date", "id", "category", "revenue", "unit_price"}
 
 # Date formatting
 DATE_FORMAT = "%Y-%m-%d"
