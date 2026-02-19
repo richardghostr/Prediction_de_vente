@@ -1,11 +1,11 @@
 """Evaluation module for trained sales prediction models.
 
-Loads a saved model artifact and evaluates it against the processed features
-dataset using a temporal train/test split.
+Group-aware version: evaluates models trained on multi-series data
+(store x product groups) without destructive date aggregation.
 
 Usage:
     python -m src.models.evaluate
-    python -m src.models.evaluate --horizon 30 --lags 1,7 --windows 3,7
+    python -m src.models.evaluate --horizon 30 --lags 1,7,14 --windows 7,14
 """
 
 import argparse
@@ -13,7 +13,7 @@ import json
 import sys
 from math import sqrt
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Dict, Any
 
 import joblib
 import numpy as np
@@ -25,6 +25,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.features import build_feature_pipeline
+from src.config import (
+    PREDICT_LAGS, PREDICT_WINDOWS, FEATURE_EXCLUDE,
+    GROUP_COLS, CATEGORICAL_FEATURES,
+)
 
 FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
 ARTIFACTS_PATH = PROJECT_ROOT / "models" / "artifacts"
@@ -35,9 +39,15 @@ def _parse_int_list(s: str) -> List[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
 def find_latest_model(pattern: str = "model_*_baseline.pkl") -> Optional[Path]:
     """Return the most recent model artifact matching the pattern."""
-    files = sorted(ARTIFACTS_PATH.glob(pattern))
+    files = sorted(ARTIFACTS_PATH.glob("model_*_improved.pkl"))
+    if not files:
+        files = sorted(ARTIFACTS_PATH.glob(pattern))
     if not files:
         return None
     return files[-1]
@@ -54,26 +64,106 @@ def load_model(model_path: Optional[Path] = None):
     return model, model_path
 
 
+def _load_model_config(model_path: Path) -> Optional[Dict[str, Any]]:
+    """Load lags/windows/encoders config saved alongside the model artifact."""
+    config_path = model_path.parent / (model_path.stem + "_config.json")
+    if not config_path.exists():
+        return None
+    try:
+        with open(config_path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
 def compute_metrics(y_true: pd.Series, y_pred: np.ndarray) -> Dict[str, float]:
-    """Compute standard regression metrics."""
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = sqrt(mean_squared_error(y_true, y_pred))
-    r2 = r2_score(y_true, y_pred)
+    """Compute regression metrics with robust MAPE/sMAPE handling."""
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
 
-    # MAPE (avoid division by zero)
-    mask = y_true != 0
-    if mask.any():
-        mape = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
-    else:
-        mape = float("nan")
+    mae = float(mean_absolute_error(yt, yp))
+    rmse = float(sqrt(mean_squared_error(yt, yp)))
+    r2 = float(r2_score(yt, yp))
+    medae = float(np.median(np.abs(yt - yp)))
+    bias = float(np.mean(yp - yt))
 
-    return {
-        "MAE": float(mae),
-        "RMSE": float(rmse),
-        "R2": float(r2),
-        "MAPE": mape,
+    # MAPE (exclude near-zero actuals)
+    mask = np.abs(yt) >= 1.0
+    mape = float(np.mean(np.abs((yt[mask] - yp[mask]) / yt[mask])) * 100) if mask.any() else float("nan")
+
+    # sMAPE
+    denom = (np.abs(yt) + np.abs(yp))
+    mask_s = denom > 0
+    smape = float(np.mean(2.0 * np.abs(yt[mask_s] - yp[mask_s]) / denom[mask_s]) * 100) if mask_s.any() else float("nan")
+
+    return {"MAE": mae, "RMSE": rmse, "R2": r2, "MedAE": medae, "MAPE": mape, "sMAPE": smape, "Bias": bias}
+
+
+# ---------------------------------------------------------------------------
+# Feature alignment (avoids SettingWithCopyWarning)
+# ---------------------------------------------------------------------------
+
+def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
+    """Align a DataFrame to the model's expected features.
+
+    Uses explicit .copy() and .loc[] to avoid SettingWithCopyWarning.
+    """
+    if not hasattr(model, "feature_names_in_"):
+        return X.copy()
+
+    expected = list(model.feature_names_in_)
+    out = X.copy()
+
+    # Add missing columns with zeros
+    for col in expected:
+        if col not in out.columns:
+            out.loc[:, col] = 0
+
+    # Drop extra columns
+    extra = [c for c in out.columns if c not in expected]
+    if extra:
+        out = out.drop(columns=extra)
+
+    # Reorder
+    return out[expected]
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+def _diagnose_data(y_train: pd.Series, y_test: pd.Series) -> Dict[str, Any]:
+    """Generate diagnostic information about the target variable distribution."""
+    diag = {
+        "train_mean": float(y_train.mean()),
+        "train_std": float(y_train.std()),
+        "train_min": float(y_train.min()),
+        "train_max": float(y_train.max()),
+        "train_n": len(y_train),
+        "test_mean": float(y_test.mean()),
+        "test_std": float(y_test.std()),
+        "test_min": float(y_test.min()),
+        "test_max": float(y_test.max()),
+        "test_n": len(y_test),
     }
 
+    warnings_list = []
+    if diag["train_std"] > 0 and abs(diag["train_mean"] - diag["test_mean"]) > 2 * diag["train_std"]:
+        warnings_list.append("Significant distribution shift between train and test means.")
+    near_zero_pct = float((np.abs(y_test) < 1.0).sum() / len(y_test) * 100) if len(y_test) > 0 else 0
+    if near_zero_pct > 20:
+        warnings_list.append(f"{near_zero_pct:.1f}% of test values are near-zero; MAPE will be unreliable.")
+    diag["warnings"] = warnings_list
+    return diag
+
+
+# ---------------------------------------------------------------------------
+# Main evaluation
+# ---------------------------------------------------------------------------
 
 def evaluate(
     model_path: Optional[Path] = None,
@@ -81,102 +171,180 @@ def evaluate(
     windows: Optional[List[int]] = None,
     horizon: int = 30,
 ) -> Dict[str, Any]:
-    """Full evaluation pipeline: load model, prepare data, compute metrics."""
-    if lags is None:
-        lags = [1, 7]
-    if windows is None:
-        windows = [3, 7]
+    """Full evaluation pipeline (group-aware, no aggregation).
 
-    # Load model
+    1. Load model + its config (lags, windows, encoders).
+    2. Rebuild features using the same group-aware pipeline as training.
+    3. Split by date cutoff (same logic as train.py).
+    4. Align features to model expectations.
+    5. Compute train/test metrics.
+    """
+    # 1. Load model
     model, actual_path = load_model(model_path)
+    model_config = _load_model_config(actual_path)
 
-    # Load and prepare data
+    # Resolve lags/windows from model config -> CLI -> shared config
+    if model_config:
+        if lags is None:
+            lags = model_config.get("lags", PREDICT_LAGS)
+        if windows is None:
+            windows = model_config.get("windows", PREDICT_WINDOWS)
+        encoders = model_config.get("encoders")
+        print(f"[evaluate] Using model config: lags={lags}, windows={windows}")
+    else:
+        if lags is None:
+            lags = PREDICT_LAGS
+        if windows is None:
+            windows = PREDICT_WINDOWS
+        encoders = None
+        print(f"[evaluate] Using shared config: lags={lags}, windows={windows}")
+
+    # 2. Load raw features CSV (NOT aggregated)
+    if not FEATURES_PATH.exists():
+        raise FileNotFoundError(f"Features file not found at {FEATURES_PATH}")
+
     df = pd.read_csv(FEATURES_PATH, parse_dates=["date"])
-    df = df.sort_values("date").reset_index(drop=True)
+    available_groups = [c for c in GROUP_COLS if c in df.columns]
+    cat_cols = [c for c in CATEGORICAL_FEATURES if c in df.columns]
+    sort_cols = available_groups + ["date"]
+    df = df.sort_values(sort_cols).reset_index(drop=True)
 
-    # Handle duplicate dates
-    if df["date"].duplicated().any():
-        df = df.groupby("date").mean(numeric_only=True).reset_index()
+    print(f"[evaluate] Loaded {len(df)} rows, groups: {available_groups}")
 
-    # Rebuild features
-    df = build_feature_pipeline(df, lags=lags, windows=windows)
+    # Rebuild features (group-aware)
+    df, _ = build_feature_pipeline(
+        df, lags=lags, windows=windows,
+        group_cols=available_groups if available_groups else None,
+        categorical_cols=cat_cols if cat_cols else None,
+        encoders=encoders,
+    )
     df = df.dropna().reset_index(drop=True)
+    print(f"[evaluate] After feature engineering: {len(df)} rows, {len(df.columns)} columns")
 
-    if len(df) <= horizon:
-        raise ValueError(f"Not enough data ({len(df)} rows) for horizon={horizon}")
+    # 3. Split by date cutoff (same logic as train.py)
+    unique_dates = sorted(df["date"].unique())
+    effective_horizon = horizon
+    if effective_horizon >= len(unique_dates):
+        effective_horizon = max(1, len(unique_dates) // 5)
+        print(f"[evaluate] Adjusted horizon to {effective_horizon} (not enough unique dates)")
 
-    # Split
-    feature_cols = [c for c in df.columns if c not in ("value", "date")]
-    X = df[feature_cols]
-    y = df["value"]
+    cutoff_date = unique_dates[-effective_horizon]
+    train_mask = df["date"] < cutoff_date
+    test_mask = df["date"] >= cutoff_date
 
-    X_train, X_test = X.iloc[:-horizon], X.iloc[-horizon:]
-    y_train, y_test = y.iloc[:-horizon], y.iloc[-horizon:]
+    exclude_cols = set(FEATURE_EXCLUDE) | {"value", "date"}
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
 
-    # Align features to model expectations
-    try:
-        if hasattr(model, "feature_names_in_"):
-            expected = list(model.feature_names_in_)
-            for col in expected:
-                if col not in X_test.columns:
-                    X_test[col] = 0
-                    X_train[col] = 0
-            extra = [c for c in X_test.columns if c not in expected]
-            if extra:
-                X_test = X_test.drop(columns=extra)
-                X_train = X_train.drop(columns=extra)
-            X_test = X_test[expected]
-            X_train = X_train[expected]
-    except Exception:
-        pass
+    X_train = df.loc[train_mask, feature_cols].copy()
+    y_train = df.loc[train_mask, "value"].copy()
+    X_test = df.loc[test_mask, feature_cols].copy()
+    y_test = df.loc[test_mask, "value"].copy()
 
-    # Predict
+    print(f"[evaluate] Train: {len(y_train)} samples, Test: {len(y_test)} samples")
+    print(f"[evaluate] Date cutoff: {cutoff_date}")
+
+    # 4. Align features to model expectations
+    X_train = _align_features_to_model(X_train, model)
+    X_test = _align_features_to_model(X_test, model)
+
+    if hasattr(model, "feature_names_in_"):
+        expected = set(model.feature_names_in_)
+        matched = expected & set(feature_cols)
+        missing = expected - set(feature_cols)
+        extra = set(feature_cols) - expected
+        print(f"[evaluate] Features: {len(matched)} matched, {len(missing)} filled with 0, {len(extra)} dropped")
+        if missing:
+            print(f"[evaluate] WARNING: These model features were filled with 0: {sorted(missing)}")
+
+    # Diagnostics
+    diagnostics = _diagnose_data(y_train, y_test)
+    for w in diagnostics.get("warnings", []):
+        print(f"[evaluate] DATA WARNING: {w}")
+
+    # 5. Predict and compute metrics
     y_pred_train = model.predict(X_train)
     y_pred_test = model.predict(X_test)
 
-    # Metrics
     train_metrics = compute_metrics(y_train, y_pred_train)
     test_metrics = compute_metrics(y_test, y_pred_test)
 
+    overfit_ratio = test_metrics["MAE"] / train_metrics["MAE"] if train_metrics["MAE"] > 0 else float("inf")
+
     results = {
         "model_path": str(actual_path),
-        "horizon": horizon,
+        "horizon": effective_horizon,
         "lags": lags,
         "windows": windows,
         "train": train_metrics,
         "test": test_metrics,
         "num_train_samples": len(y_train),
         "num_test_samples": len(y_test),
+        "num_features": X_test.shape[1],
+        "feature_columns": list(X_test.columns),
+        "diagnostics": diagnostics,
+        "overfit_ratio": float(overfit_ratio),
     }
 
+    _print_interpretation(results)
     return results
 
 
+def _print_interpretation(results: Dict[str, Any]) -> None:
+    """Print human-readable interpretation."""
+    test = results["test"]
+    train = results["train"]
+
+    print(f"\n{'='*60}")
+    print("[evaluate] RESULTS SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Train  -> MAE={train['MAE']:.4f}  RMSE={train['RMSE']:.4f}  R2={train['R2']:.4f}  Bias={train['Bias']:.4f}")
+    print(f"  Test   -> MAE={test['MAE']:.4f}  RMSE={test['RMSE']:.4f}  R2={test['R2']:.4f}  Bias={test['Bias']:.4f}")
+    if not np.isnan(test.get("MAPE", float("nan"))):
+        print(f"  MAPE   -> {test['MAPE']:.2f}%")
+    print(f"  sMAPE  -> {test['sMAPE']:.2f}%")
+    print(f"  MedAE  -> {test['MedAE']:.4f}")
+    print(f"  Overfit ratio: {results['overfit_ratio']:.2f}")
+
+    r2 = test["R2"]
+    if r2 < 0:
+        print("  VERDICT: Model is WORSE than the mean -- predictions are not useful.")
+    elif r2 < 0.3:
+        print("  VERDICT: Weak model -- captures very little signal.")
+    elif r2 < 0.7:
+        print("  VERDICT: Moderate model -- captures some patterns but can improve.")
+    else:
+        print("  VERDICT: Good model -- explains significant variance in the data.")
+
+    if results["overfit_ratio"] > 3.0:
+        print("  WARNING: Severe overfitting detected (ratio > 3x).")
+    if abs(test.get("Bias", 0)) > test["MAE"] * 0.5:
+        direction = "over" if test["Bias"] > 0 else "under"
+        print(f"  WARNING: Systematic {direction}-prediction (bias={test['Bias']:.4f}).")
+    print(f"{'='*60}\n")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Evaluate a trained model artifact")
-    parser.add_argument("--model", type=Path, default=None, help="Path to model .pkl (default: latest in models/artifacts)")
-    parser.add_argument("--lags", default="1,7", help="Comma-separated lag values")
-    parser.add_argument("--windows", default="3,7", help="Comma-separated rolling window sizes")
-    parser.add_argument("--horizon", type=int, default=30, help="Test horizon in days")
-    parser.add_argument("--save", action="store_true", help="Save metrics to models/metrics/")
+    parser.add_argument("--model", type=Path, default=None)
+    parser.add_argument("--lags", default=None)
+    parser.add_argument("--windows", default=None)
+    parser.add_argument("--horizon", type=int, default=30)
+    parser.add_argument("--save", action="store_true")
     args = parser.parse_args(argv)
 
-    lags = _parse_int_list(args.lags)
-    windows = _parse_int_list(args.windows)
+    lags = _parse_int_list(args.lags) if args.lags else None
+    windows = _parse_int_list(args.windows) if args.windows else None
 
     try:
-        results = evaluate(
-            model_path=args.model,
-            lags=lags,
-            windows=windows,
-            horizon=args.horizon,
-        )
+        results = evaluate(model_path=args.model, lags=lags, windows=windows, horizon=args.horizon)
     except Exception as e:
         print(f"[evaluate] Error: {e}")
+        import traceback; traceback.print_exc()
         return 1
-
-    print("\n[evaluate] Results:")
-    print(json.dumps(results, indent=2))
 
     if args.save:
         METRICS_PATH.mkdir(parents=True, exist_ok=True)
@@ -184,8 +352,8 @@ def main(argv=None) -> int:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = METRICS_PATH / f"eval_metrics_{ts}.json"
         with open(out_path, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"\n[evaluate] Metrics saved to {out_path}")
+            json.dump(results, f, indent=2, default=str)
+        print(f"[evaluate] Metrics saved to {out_path}")
 
     return 0
 
