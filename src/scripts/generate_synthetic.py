@@ -53,3 +53,4 @@ df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 out_df = df.rename(columns={"revenue": "value"})[["date", "value", "store_id", "product_id", "quantity", "price"]]
 out_df.to_csv(OUT, index=False)
 print(f"Written synthetic clean CSV to {OUT} (rows={len(out_df)})")
+

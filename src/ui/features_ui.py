@@ -196,13 +196,19 @@ def render_features_ui():
 
         try:
             with st.spinner("Generation des features en cours..."):
-                feat = build_feature_pipeline(
+                result = build_feature_pipeline(
                     df,
                     date_col=date_col,
                     value_col=value_col,
                     lags=lags,
                     windows=windows,
                 )
+
+            # build_feature_pipeline may return (df, encoders) or just df
+            if isinstance(result, tuple) and len(result) == 2:
+                feat, _ = result
+            else:
+                feat = result
 
             st.success(f"Features generees ! {len(df.columns)} -> {len(feat.columns)} colonnes ({len(feat)} lignes)")
 

@@ -861,14 +861,22 @@ else:
 
 # Build features
 features_df = None
+features_encoders = None
 if build_feature_pipeline:
     try:
-        features_df = build_feature_pipeline(
+        # build_feature_pipeline returns (df, encoders) in the current pipeline
+        result = build_feature_pipeline(
             df_clean, date_col=date_col, value_col=value_col,
             lags=[1, 7], windows=[3, 7],
         )
+        if isinstance(result, tuple) and len(result) == 2:
+            features_df, features_encoders = result
+        else:
+            features_df = result
+            features_encoders = None
     except Exception:
         features_df = None
+        features_encoders = None
 
 # Archive if requested
 if archive_outputs:
@@ -1720,40 +1728,40 @@ with tab_model:
                 hide_index=True,
             )
 
-    # Saved metrics files
-    st.divider()
-    st.subheader("Metriques sauvegardees")
-    metrics_dir = Path(config.MODELS_METRICS_DIR) if config and hasattr(config, "MODELS_METRICS_DIR") else Path("models/metrics")
-    if metrics_dir.exists():
-        json_files = sorted(metrics_dir.glob("*.json"), reverse=True)
-        if json_files:
-            selected_metric = st.selectbox(
-                "Selectionner un fichier de metriques",
-                options=[f.name for f in json_files],
-                key="metric_file_sel",
-            )
-            if selected_metric:
-                try:
-                    import json
-                    with open(metrics_dir / selected_metric) as f:
-                        data = json.load(f)
-                    
-                    # Display metrics in a nice layout if possible
-                    if isinstance(data, dict):
-                        # Extract common metric keys
-                        metric_keys = [k for k in data if isinstance(data[k], (int, float))]
-                        if metric_keys:
-                            metric_cols = st.columns(min(len(metric_keys), 4))
-                            for i, k in enumerate(metric_keys):
-                                with metric_cols[i % len(metric_cols)]:
-                                    st.metric(k, f"{data[k]:.4f}" if isinstance(data[k], float) else str(data[k]))
+        # Saved metrics files
+        st.divider()
+        st.subheader("Metriques sauvegardees")
+        metrics_dir = Path(config.MODELS_METRICS_DIR) if config and hasattr(config, "MODELS_METRICS_DIR") else Path("models/metrics")
+        if metrics_dir.exists():
+            json_files = sorted(metrics_dir.glob("*.json"), reverse=True)
+            if json_files:
+                selected_metric = st.selectbox(
+                    "Selectionner un fichier de metriques",
+                    options=[f.name for f in json_files],
+                    key="metric_file_sel",
+                )
+                if selected_metric:
+                    try:
+                        import json
+                        with open(metrics_dir / selected_metric) as f:
+                            data = json.load(f)
                         
-                        st.markdown("**Donnees completes :**")
-                    st.json(data)
-                except Exception as e:
-                    st.error(f"Erreur de lecture : {e}")
-        else:
-            st.info("Aucun fichier de metriques trouve.")
+                        # Display metrics in a nice layout if possible
+                        if isinstance(data, dict):
+                            # Extract common metric keys
+                            metric_keys = [k for k in data if isinstance(data[k], (int, float))]
+                            if metric_keys:
+                                metric_cols = st.columns(min(len(metric_keys), 4))
+                                for i, k in enumerate(metric_keys):
+                                    with metric_cols[i % len(metric_cols)]:
+                                        st.metric(k, f"{data[k]:.4f}" if isinstance(data[k], float) else str(data[k]))
+                            
+                            st.markdown("**Donnees completes :**")
+                        st.json(data)
+                    except Exception as e:
+                        st.error(f"Erreur de lecture : {e}")
+            else:
+                st.info("Aucun fichier de metriques trouve.")
     else:
         st.info("Le dossier de metriques n'existe pas encore. Entrainez un modele pour generer des metriques.")
 

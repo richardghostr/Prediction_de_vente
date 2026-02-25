@@ -155,6 +155,19 @@ def build_feature_pipeline(
     """
     df = df.copy()
 
+    # Normalize common column aliases so downstream code (train/eval/predict)
+    # sees consistent column names. This avoids mismatches when upstream
+    # ingestion/cleaning used different names (e.g. `id` vs `store_id`).
+    alias_map = {}
+    if "store_id" not in df.columns and "id" in df.columns:
+        alias_map["id"] = "store_id"
+    if "product_id" not in df.columns and "product" in df.columns:
+        alias_map["product"] = "product_id"
+    if "price" not in df.columns and "unit_price" in df.columns:
+        alias_map["unit_price"] = "price"
+    if alias_map:
+        df = df.rename(columns=alias_map)
+
     # Detect group columns if present in data
     if group_cols is None:
         # Try default from config

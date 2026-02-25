@@ -25,6 +25,47 @@ except Exception:
     ingest_single_csv = None
     load_config = None
 
+# Provide a safe fallback ingestion function when the project's ingest implementation
+# is not importable. This keeps the UI usable: it will write the uploaded CSV to
+# `out_dir` and optionally emit a small metadata JSON when `write_meta` is set.
+if ingest_single_csv is None:
+    def ingest_single_csv(src_path, out_dir, cfg, mapping_file=None):
+        """Minimal fallback ingestion: read and copy CSV to out_dir.
+
+        Keeps the same signature as the expected ingest function so the UI can
+        call it without additional checks.
+        """
+        outp = Path(out_dir)
+        outp.mkdir(parents=True, exist_ok=True)
+        dst = outp / f"{Path(src_path).stem}_ingest.csv"
+        try:
+            # Prefer reading/writing with pandas to normalise formatting.
+            df = pd.read_csv(src_path)
+            df.to_csv(dst, index=False)
+
+            # If caller set the `write_meta` attribute on the function, emit a
+            # tiny metadata JSON next to the CSV.
+            try:
+                if getattr(ingest_single_csv, "write_meta", False):
+                    meta = {
+                        "source": str(src_path),
+                        "rows": int(len(df)),
+                        "columns": df.columns.tolist(),
+                    }
+                    import json
+
+                    meta_path = dst.with_suffix(".json")
+                    with open(meta_path, "w", encoding="utf-8") as mf:
+                        json.dump(meta, mf, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            return str(dst)
+        except Exception:
+            # As a last resort, copy the file bytes directly.
+            shutil.copy(src_path, dst)
+            return str(dst)
+
 PALETTE = {
     "primary": "#0F4C75",
     "primary_light": "#3282B8",

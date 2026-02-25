@@ -44,13 +44,18 @@ def _parse_int_list(s: str) -> List[int]:
 # ---------------------------------------------------------------------------
 
 def find_latest_model(pattern: str = "model_*_baseline.pkl") -> Optional[Path]:
-    """Return the most recent model artifact matching the pattern."""
-    files = sorted(ARTIFACTS_PATH.glob("model_*_improved.pkl"))
-    if not files:
-        files = sorted(ARTIFACTS_PATH.glob(pattern))
-    if not files:
+    """Return the most recent model artifact if any exist.
+
+    Picks the most recently modified `model_*.pkl` file from the artifacts
+    directory to avoid missing models saved with custom tags.
+    """
+    try:
+        files = list(ARTIFACTS_PATH.glob("model_*.pkl"))
+        if not files:
+            return None
+        return max(files, key=lambda p: p.stat().st_mtime)
+    except Exception:
         return None
-    return files[-1]
 
 
 def load_model(model_path: Optional[Path] = None):
@@ -200,11 +205,40 @@ def evaluate(
         print(f"[evaluate] Using shared config: lags={lags}, windows={windows}")
 
     # 2. Load raw features CSV (NOT aggregated)
-    if not FEATURES_PATH.exists():
-        raise FileNotFoundError(f"Features file not found at {FEATURES_PATH}")
+    # If the model config saved the original training features path, prefer it
+    features_source = FEATURES_PATH
+    if model_config and model_config.get("training_features_path"):
+        cand = Path(model_config.get("training_features_path"))
+        if cand.exists():
+            features_source = cand
+            print(f"[evaluate] Using model's training features source: {features_source}")
 
-    df = pd.read_csv(FEATURES_PATH, parse_dates=["date"])
-    available_groups = [c for c in GROUP_COLS if c in df.columns]
+    if not features_source.exists():
+        raise FileNotFoundError(f"Features file not found at {features_source}")
+
+    df = pd.read_csv(features_source, parse_dates=["date"])
+    # Robust group detection: accept common aliases (e.g. 'store' or 'id' for 'store_id')
+    # Determine actual group column names present in the dataframe (use aliases)
+    available_groups = []
+    for g in GROUP_COLS:
+        if g in df.columns:
+            available_groups.append(g)
+            continue
+        # common aliases: prefer the literal alias present in the dataframe
+        if g == "store_id":
+            if "store" in df.columns:
+                available_groups.append("store")
+                continue
+            if "id" in df.columns:
+                available_groups.append("id")
+                continue
+        if g == "product_id":
+            if "product_id" in df.columns:
+                available_groups.append("product_id")
+                continue
+            if "product" in df.columns:
+                available_groups.append("product")
+                continue
     cat_cols = [c for c in CATEGORICAL_FEATURES if c in df.columns]
     sort_cols = available_groups + ["date"]
     df = df.sort_values(sort_cols).reset_index(drop=True)
@@ -212,6 +246,59 @@ def evaluate(
     print(f"[evaluate] Loaded {len(df)} rows, groups: {available_groups}")
 
     # Rebuild features (group-aware)
+    # If the features file does not contain columns expected by the model
+    # (e.g. categorical/group columns), attempt to regenerate features from a
+    # cleaned interim file so the evaluation and model expectations align.
+    expected_features = set()
+    if hasattr(model, "feature_names_in_"):
+        expected_features = set(model.feature_names_in_)
+
+    missing_expected = [c for c in expected_features if c not in df.columns]
+    if missing_expected:
+        print(f"[evaluate] Detected missing expected features: {missing_expected}. Attempting to regenerate features from cleaned data...")
+        # Find a cleaned interim file to rebuild features
+        try:
+            interim_dir = PROJECT_ROOT / "data" / "interim"
+            clean_files = sorted(interim_dir.glob("*_clean.csv"), reverse=True) if interim_dir.exists() else []
+            if clean_files:
+                src_clean = clean_files[0]
+                print(f"[evaluate] Using {src_clean} to rebuild features")
+                df_clean = pd.read_csv(src_clean, parse_dates=["date"]) if src_clean.exists() else None
+                if df_clean is not None:
+                    try:
+                        # When rebuilding from the cleaned source, let the feature
+                        # pipeline detect group columns / aliases from that file
+                        # rather than using the group columns inferred from the
+                        # training features file (they may use different names).
+                        result = build_feature_pipeline(
+                            df_clean, lags=lags, windows=windows,
+                            group_cols=None,
+                            categorical_cols=None,
+                            encoders=encoders,
+                        )
+                        if isinstance(result, tuple) and len(result) == 2:
+                            df, _ = result
+                        else:
+                            df = result
+                        # Persist regenerated features to FEATURES_PATH for reproducibility
+                        try:
+                            FEATURES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                            df.to_csv(FEATURES_PATH, index=False)
+                            print(f"[evaluate] Regenerated features saved to {FEATURES_PATH}")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[evaluate] Failed to rebuild features from {src_clean}: {e}")
+            else:
+                print("[evaluate] No cleaned interim file found to regenerate features.")
+        except Exception as e:
+            print(f"[evaluate] Error during feature regeneration attempt: {e}")
+
+    else:
+        # Normal path: rebuild features from the loaded features file (no regen needed)
+        pass
+
+    # Now run the feature pipeline on the (possibly regenerated) dataframe
     df, _ = build_feature_pipeline(
         df, lags=lags, windows=windows,
         group_cols=available_groups if available_groups else None,

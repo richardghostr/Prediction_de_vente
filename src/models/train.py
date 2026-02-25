@@ -38,7 +38,7 @@ from src.config import (
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
+FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "uploaded_generated_training_10950_features.csv"
 ARTIFACTS_PATH = PROJECT_ROOT / "models" / "artifacts"
 METRICS_PATH = PROJECT_ROOT / "models" / "metrics"
 
@@ -281,6 +281,7 @@ def save_artifacts(
     tag: str = "baseline",
     lags: Optional[List[int]] = None,
     windows: Optional[List[int]] = None,
+    training_features_path: Optional[str] = None,
 ) -> Tuple[Path, Path]:
     """Persist model, metrics, encoders, and feature config to disk."""
     ARTIFACTS_PATH.mkdir(parents=True, exist_ok=True)
@@ -305,6 +306,8 @@ def save_artifacts(
         config["encoders"] = {k: v for k, v in encoders.items()}
     if metrics.get("feature_names"):
         config["feature_names"] = metrics["feature_names"]
+    if training_features_path is not None:
+        config["training_features_path"] = str(training_features_path)
 
     config_file = model_file.parent / (model_file.stem + "_config.json")
     with open(config_file, "w") as f:
@@ -337,16 +340,23 @@ def main(argv=None) -> int:
     windows = _parse_int_list(args.windows) if args.windows else PREDICT_WINDOWS
     horizon = args.horizon
 
-    print(f"[train] Loading features from {FEATURES_PATH}")
+    features_path = FEATURES_PATH
+    print(f"[train] Loading features from {features_path}")
     print(f"[train] Config: lags={lags}, windows={windows}, horizon={horizon}")
 
-    if not FEATURES_PATH.exists():
-        print(f"[train] ERROR: Features file not found at {FEATURES_PATH}")
-        print("[train] Run the feature pipeline first: python -m src.data.features")
-        return 1
+    # Support a fallback features file when the primary training CSV is absent
+    if not features_path.exists():
+        fallback = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
+        if fallback.exists():
+            print(f"[train] Primary features file not found. Falling back to {fallback}")
+            features_path = fallback
+        else:
+            print(f"[train] ERROR: Features file not found at {features_path}")
+            print("[train] Run the feature pipeline first: python -m src.data.features")
+            return 1
 
     # Load and prepare (group-aware, NO aggregation)
-    df, encoders = load_and_prepare(FEATURES_PATH, lags=lags, windows=windows)
+    df, encoders = load_and_prepare(features_path, lags=lags, windows=windows)
     print(f"[train] Dataset shape after feature engineering: {df.shape}")
     print(f"[train] Target stats: mean={df['value'].mean():.2f}, std={df['value'].std():.2f}, "
           f"min={df['value'].min():.2f}, max={df['value'].max():.2f}")
@@ -389,7 +399,8 @@ def main(argv=None) -> int:
 
     # Save (include encoders so predict can reuse them)
     model_file, metrics_file = save_artifacts(
-        model, metrics, encoders=encoders, tag=args.tag, lags=lags, windows=windows
+        model, metrics, encoders=encoders, tag=args.tag, lags=lags, windows=windows,
+        training_features_path=str(features_path)
     )
 
     # Print results
