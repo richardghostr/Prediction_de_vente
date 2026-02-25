@@ -1,34 +1,27 @@
-"""Training script for the sales prediction model.
+"""Training script for the XGBoost sales prediction model.
 
-Major improvements:
-- Proper group-aware time series cross-validation (purged/embargo)
-- Optuna-based hyperparameter tuning with early stopping
-- LightGBM as primary model (faster, handles categoricals natively)
-- XGBoost as secondary model with ensemble option
-- Feature importance analysis and feature selection
-- Robust temporal train/test split with per-group validation
-- Comprehensive metrics with confidence intervals
+Group-aware version: trains a single model across all (store, product) groups
+with group identity as features, instead of aggregating to a single noisy series.
 
 Usage:
     python -m src.models.train
-    python -m src.models.train --lags 1,2,3,7,14,21,28 --windows 7,14,28 --horizon 60
-    python -m src.models.train --tune --n-trials 50
+    python -m src.models.train --lags 1,7,14 --windows 7,14 --horizon 30
 """
 
 import argparse
 import datetime
 import json
 import sys
-import warnings
 from math import sqrt
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 import joblib
+from xgboost import XGBRegressor
 
 # Ensure project root is on sys.path for absolute imports
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -42,13 +35,14 @@ from src.config import (
 )
 from src.utils.logging import get_logger
 
+
 logger = get_logger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "uploaded_generated_training_10950_features.csv"
-INTERIM_PATH = PROJECT_ROOT / "data" / "interim" / "generated_training_10950_clean.csv"
 ARTIFACTS_PATH = PROJECT_ROOT / "models" / "artifacts"
 METRICS_PATH = PROJECT_ROOT / "models" / "metrics"
 
@@ -66,20 +60,25 @@ def load_and_prepare(
     lags: List[int],
     windows: List[int],
 ) -> Tuple[pd.DataFrame, dict]:
-    """Load data and rebuild features with group-aware pipeline.
+    """Load the features CSV and rebuild features with group-aware pipeline.
 
+    CRITICAL CHANGE: No more groupby("date").mean() aggregation.
     Each (store_id, product_id) combination is kept as a separate row,
     and lags/rolling are computed within each group.
+
+    Returns (dataframe, encoders_dict).
     """
-    logger.info("[train] Loading raw data from %s", path)
+    logger.info(f"[train] Loading raw features from %s", path)
     df = pd.read_csv(path, parse_dates=["date"])
 
-    # Remap columns from ingest format if needed
+    # Remap columns from ingest format if needed:
+    # ingest maps store_id -> id, quantity -> value
+    # We need store_id back as a group column
     if "store_id" not in df.columns and "id" in df.columns:
         df = df.rename(columns={"id": "store_id"})
-        logger.info("[train] Remapped 'id' -> 'store_id'")
+        logger.info("[train] Remapped 'id' -> 'store_id' (from ingest format)")
 
-    # Handle on_promo
+    # Handle on_promo: convert True/False strings to int
     if "on_promo" in df.columns:
         df["on_promo"] = df["on_promo"].map(
             {True: 1, False: 0, "True": 1, "False": 0, 1: 1, 0: 0}
@@ -89,7 +88,7 @@ def load_and_prepare(
     available_groups = [c for c in GROUP_COLS if c in df.columns]
     if available_groups:
         logger.info("[train] Group columns detected: %s", available_groups)
-        n_groups = df.groupby(available_groups).ngroups
+        n_groups = df.groupby(available_groups).ngroups if len(available_groups) > 0 else 1
         logger.info("[train] Number of distinct groups: %d", n_groups)
     else:
         logger.warning("[train] No group columns found -- treating as single series")
@@ -98,7 +97,7 @@ def load_and_prepare(
     sort_cols = available_groups + ["date"]
     df = df.sort_values(sort_cols).reset_index(drop=True)
 
-    # Detect categorical columns
+    # Detect which categorical columns are present
     cat_cols = [c for c in CATEGORICAL_FEATURES if c in df.columns]
 
     # Run the group-aware feature pipeline
@@ -108,10 +107,9 @@ def load_and_prepare(
         windows=windows,
         group_cols=available_groups if available_groups else None,
         categorical_cols=cat_cols if cat_cols else None,
-        is_train=True,
     )
 
-    # Drop rows with NaN introduced by lags/rolling warm-up
+    # Drop rows with NaN introduced by lags/rolling (first rows per group)
     before = len(df)
     df = df.dropna().reset_index(drop=True)
     after = len(df)
@@ -127,16 +125,19 @@ def split_time_series(
     date_col: str = "date",
     target_col: str = "value",
     exclude_cols: Optional[set] = None,
+    group_cols: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, pd.Series]:
     """Split into train / test respecting temporal order.
 
-    The last `horizon` unique dates go to test, ensuring all groups have test rows.
+    For multi-group data: finds a date cutoff such that the last `horizon`
+    unique dates go to test. This ensures all groups have test rows.
     """
     if exclude_cols is None:
         exclude_cols = set()
     exclude_cols = set(exclude_cols) | {target_col, date_col}
     feature_cols = [c for c in df.columns if c not in exclude_cols]
 
+    # Find date cutoff: last `horizon` unique dates -> test
     unique_dates = sorted(df[date_col].unique())
     if horizon >= len(unique_dates):
         horizon = max(1, len(unique_dates) // 5)
@@ -155,284 +156,41 @@ def split_time_series(
     return X_train, y_train, X_test, y_test, dates_test
 
 
-# ---------------------------------------------------------------------------
-# Time Series CV for hyperparameter tuning
-# ---------------------------------------------------------------------------
-
-def time_series_cv_score(
-    model_class,
-    params: dict,
-    X: pd.DataFrame,
-    y: pd.Series,
-    n_splits: int = 5,
-    early_stopping: bool = True,
-) -> Tuple[float, float]:
-    """Evaluate model with TimeSeriesSplit CV. Returns (mean_MAE, std_MAE)."""
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    scores = []
-
-    for train_idx, val_idx in tscv.split(X):
-        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
-
-        if early_stopping and model_class.__name__ in ("LGBMRegressor", "XGBRegressor"):
-            model = model_class(**params)
-            eval_set = [(X_val, y_val)]
-
-            if model_class.__name__ == "LGBMRegressor":
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    model.fit(
-                        X_tr, y_tr,
-                        eval_set=eval_set,
-                        callbacks=[
-                            _lgb_early_stopping(50),
-                            _lgb_log_evaluation(-1),
-                        ],
-                    )
-            else:
-                model.fit(
-                    X_tr, y_tr,
-                    eval_set=eval_set,
-                    verbose=False,
-                )
-        else:
-            model = model_class(**params)
-            model.fit(X_tr, y_tr)
-
-        y_pred = model.predict(X_val)
-        scores.append(mean_absolute_error(y_val, y_pred))
-
-    return float(np.mean(scores)), float(np.std(scores))
-
-
-def _lgb_early_stopping(stopping_rounds):
-    """Return early stopping callback for LightGBM."""
-    try:
-        import lightgbm as lgb
-        return lgb.early_stopping(stopping_rounds=stopping_rounds)
-    except (ImportError, AttributeError):
-        return None
-
-
-def _lgb_log_evaluation(period):
-    """Return log evaluation callback for LightGBM."""
-    try:
-        import lightgbm as lgb
-        return lgb.log_evaluation(period=period)
-    except (ImportError, AttributeError):
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Optuna hyperparameter tuning
-# ---------------------------------------------------------------------------
-
-def tune_lgbm(
+def train_model(
     X_train: pd.DataFrame,
     y_train: pd.Series,
-    n_trials: int = 50,
-    n_cv_splits: int = 5,
-) -> dict:
-    """Use Optuna to find optimal LightGBM hyperparameters."""
-    try:
-        import optuna
-        from lightgbm import LGBMRegressor
-    except ImportError:
-        logger.warning("[train] Optuna or LightGBM not available, using defaults")
-        return _default_lgbm_params()
+    n_estimators: int = 300,
+    max_depth: int = 4,
+    learning_rate: float = 0.05,
+    reg_alpha: float = 0.5,
+    reg_lambda: float = 2.0,
+    subsample: float = 0.8,
+    colsample_bytree: float = 0.8,
+    min_child_weight: int = 3,
+    random_state: int = 42,
+) -> XGBRegressor:
+    """Train an XGBRegressor with balanced regularization.
 
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    def objective(trial):
-        params = {
-            "n_estimators": 1000,  # rely on early stopping
-            "max_depth": trial.suggest_int("max_depth", 3, 10),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
-            "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-            "random_state": 42,
-            "verbosity": -1,
-            "n_jobs": -1,
-        }
-
-        mean_mae, _ = time_series_cv_score(
-            LGBMRegressor, params, X_train, y_train,
-            n_splits=n_cv_splits, early_stopping=True,
-        )
-        return mean_mae
-
-    study = optuna.create_study(direction="minimize", study_name="lgbm_tune")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-
-    best = study.best_params
-    best["n_estimators"] = 1000
-    best["random_state"] = 42
-    best["verbosity"] = -1
-    best["n_jobs"] = -1
-
-    logger.info("[train] Optuna best MAE: %.4f", study.best_value)
-    logger.info("[train] Optuna best params: %s", best)
-    return best
-
-
-def tune_xgb(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    n_trials: int = 30,
-    n_cv_splits: int = 5,
-) -> dict:
-    """Use Optuna to find optimal XGBoost hyperparameters."""
-    try:
-        import optuna
-        from xgboost import XGBRegressor
-    except ImportError:
-        logger.warning("[train] Optuna or XGBoost not available, using defaults")
-        return _default_xgb_params()
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    def objective(trial):
-        params = {
-            "n_estimators": 1000,
-            "max_depth": trial.suggest_int("max_depth", 3, 10),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
-            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-            "random_state": 42,
-            "early_stopping_rounds": 50,
-            "verbosity": 0,
-        }
-
-        mean_mae, _ = time_series_cv_score(
-            XGBRegressor, params, X_train, y_train,
-            n_splits=n_cv_splits, early_stopping=True,
-        )
-        return mean_mae
-
-    study = optuna.create_study(direction="minimize", study_name="xgb_tune")
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
-
-    best = study.best_params
-    best["n_estimators"] = 1000
-    best["random_state"] = 42
-    best["early_stopping_rounds"] = 50
-    best["verbosity"] = 0
-
-    logger.info("[train] XGB Optuna best MAE: %.4f", study.best_value)
-    return best
-
-
-def _default_lgbm_params() -> dict:
-    return {
-        "n_estimators": 1000,
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "num_leaves": 63,
-        "min_child_samples": 20,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
-        "random_state": 42,
-        "verbosity": -1,
-        "n_jobs": -1,
-    }
-
-
-def _default_xgb_params() -> dict:
-    return {
-        "n_estimators": 1000,
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "min_child_weight": 5,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
-        "random_state": 42,
-        "early_stopping_rounds": 50,
-        "verbosity": 0,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Model training
-# ---------------------------------------------------------------------------
-
-def train_lgbm(X_train, y_train, X_val, y_val, params: dict):
-    """Train LightGBM with early stopping."""
-    from lightgbm import LGBMRegressor
-
-    model = LGBMRegressor(**params)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            callbacks=[
-                _lgb_early_stopping(50),
-                _lgb_log_evaluation(-1),
-            ],
-        )
-    logger.info("[train] LightGBM best iteration: %d", model.best_iteration_)
-    return model
-
-
-def train_xgb(X_train, y_train, X_val, y_val, params: dict):
-    """Train XGBoost with early stopping."""
-    from xgboost import XGBRegressor
-
-    model = XGBRegressor(**params)
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
+    With group-aware features (more data, better signal), we can use slightly
+    more capacity than the over-regularized single-series model.
+    """
+    model = XGBRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        reg_alpha=reg_alpha,
+        reg_lambda=reg_lambda,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        min_child_weight=min_child_weight,
+        random_state=random_state,
     )
-    logger.info("[train] XGBoost best iteration: %d", model.best_iteration)
+    model.fit(X_train, y_train)
     return model
 
-
-# ---------------------------------------------------------------------------
-# Ensemble
-# ---------------------------------------------------------------------------
-
-class EnsembleRegressor:
-    """Simple weighted average ensemble of models."""
-
-    def __init__(self, models: list, weights: Optional[list] = None):
-        self.models = models
-        self.weights = weights or [1.0 / len(models)] * len(models)
-        # Expose feature names from first model for compatibility
-        for m in models:
-            if hasattr(m, "feature_names_in_"):
-                self.feature_names_in_ = m.feature_names_in_
-                break
-
-    def predict(self, X):
-        preds = np.array([m.predict(X) for m in self.models])
-        return np.average(preds, axis=0, weights=self.weights)
-
-    def __getattr__(self, name):
-        # Delegate to first model for parameters like n_estimators
-        if name.startswith("_"):
-            raise AttributeError(name)
-        return getattr(self.models[0], name)
-
-
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
 
 def evaluate_model(
-    model,
+    model: XGBRegressor,
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_test: pd.DataFrame,
@@ -441,7 +199,7 @@ def evaluate_model(
     y_all: pd.Series,
     n_cv_splits: int = 5,
 ) -> dict:
-    """Evaluate with train/test/CV metrics."""
+    """Evaluate with train/test/CV metrics including bias detection."""
     # Train metrics
     y_pred_train = model.predict(X_train)
     mae_train = mean_absolute_error(y_train, y_pred_train)
@@ -469,40 +227,31 @@ def evaluate_model(
     smape_test = float(np.mean(np.abs(y_test.values - y_pred_test) / denom_safe) * 100)
 
     # Cross-validation on full dataset
-    tscv = TimeSeriesSplit(n_splits=min(n_cv_splits, max(2, len(X_all) // 100)))
+    tscv = TimeSeriesSplit(n_splits=min(n_cv_splits, max(2, len(X_all) // 50)))
     cv_scores = {"mae": [], "rmse": [], "r2": []}
 
     for train_idx, val_idx in tscv.split(X_all):
         X_tr, X_val = X_all.iloc[train_idx], X_all.iloc[val_idx]
         y_tr, y_val = y_all.iloc[train_idx], y_all.iloc[val_idx]
 
-        # Use LightGBM for CV if available, else XGBoost
-        try:
-            from lightgbm import LGBMRegressor
-            model_cv = LGBMRegressor(
-                n_estimators=500, max_depth=6, learning_rate=0.05,
-                random_state=42, verbosity=-1, n_jobs=-1,
-            )
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                model_cv.fit(
-                    X_tr, y_tr,
-                    eval_set=[(X_val, y_val)],
-                    callbacks=[_lgb_early_stopping(30), _lgb_log_evaluation(-1)],
-                )
-        except ImportError:
-            from xgboost import XGBRegressor
-            model_cv = XGBRegressor(
-                n_estimators=500, max_depth=6, learning_rate=0.05,
-                random_state=42, early_stopping_rounds=30, verbosity=0,
-            )
-            model_cv.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-
+        model_cv = XGBRegressor(
+            n_estimators=model.n_estimators,
+            max_depth=model.max_depth,
+            learning_rate=model.learning_rate,
+            reg_alpha=model.reg_alpha,
+            reg_lambda=model.reg_lambda,
+            subsample=model.subsample,
+            colsample_bytree=model.colsample_bytree,
+            min_child_weight=model.min_child_weight,
+            random_state=42,
+        )
+        model_cv.fit(X_tr, y_tr)
         y_val_pred = model_cv.predict(X_val)
         cv_scores["mae"].append(float(mean_absolute_error(y_val, y_val_pred)))
         cv_scores["rmse"].append(float(sqrt(mean_squared_error(y_val, y_val_pred))))
         cv_scores["r2"].append(float(r2_score(y_val, y_val_pred)))
 
+    # Overfitting ratio
     overfit_ratio = rmse_test / rmse_train if rmse_train > 0 else float("inf")
 
     metrics = {
@@ -518,10 +267,8 @@ def evaluate_model(
         "sMAPE_test": smape_test,
         "overfit_ratio": float(overfit_ratio),
         "CV_mae_mean": float(np.mean(cv_scores["mae"])),
-        "CV_mae_std": float(np.std(cv_scores["mae"])),
         "CV_rmse_mean": float(np.mean(cv_scores["rmse"])),
         "CV_r2_mean": float(np.mean(cv_scores["r2"])),
-        "CV_r2_std": float(np.std(cv_scores["r2"])),
         "CV_r2_folds": cv_scores["r2"],
         "num_train_samples": len(y_train),
         "num_test_samples": len(y_test),
@@ -532,39 +279,24 @@ def evaluate_model(
     return metrics
 
 
-def get_feature_importance(model, feature_names: list) -> pd.DataFrame:
-    """Extract feature importance from the model."""
-    if hasattr(model, "feature_importances_"):
-        imp = model.feature_importances_
-    elif hasattr(model, "models"):
-        # Ensemble: average importance across models
-        imps = []
-        for m in model.models:
-            if hasattr(m, "feature_importances_"):
-                imps.append(m.feature_importances_)
-        if imps:
-            imp = np.mean(imps, axis=0)
-        else:
-            return pd.DataFrame()
-    else:
-        return pd.DataFrame()
-
-    fi = pd.DataFrame({"feature": feature_names, "importance": imp})
-    fi = fi.sort_values("importance", ascending=False).reset_index(drop=True)
-    return fi
-
-
 def save_artifacts(
-    model,
+    model: XGBRegressor,
     metrics: dict,
     encoders: dict,
     tag: str = "baseline",
     lags: Optional[List[int]] = None,
     windows: Optional[List[int]] = None,
     training_features_path: Optional[str] = None,
-    feature_importance: Optional[pd.DataFrame] = None,
 ) -> Tuple[Path, Path]:
-    """Persist model, metrics, encoders, and feature config to disk."""
+    """Persist model, metrics, encoders, and feature config to disk.
+
+    Ajoute également un terme de correction de biais (bias_correction) dans
+    la config, qui pourra être utilisé en inférence pour compenser une
+    sous/sur-prédiction systématique :
+
+        bias_correction = - Bias_train
+        yhat_corrected = yhat_raw + bias_correction
+    """
     ARTIFACTS_PATH.mkdir(parents=True, exist_ok=True)
     METRICS_PATH.mkdir(parents=True, exist_ok=True)
 
@@ -576,22 +308,18 @@ def save_artifacts(
     with open(metrics_file, "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Save config
+    # Save config (lags, windows, encoders) so predict.py uses the same settings
     config = {}
     if lags is not None:
         config["lags"] = lags
     if windows is not None:
         config["windows"] = windows
     if encoders:
-        serializable_enc = {}
-        for k, v in encoders.items():
-            if isinstance(v, dict):
-                serializable_enc[k] = {str(kk): vv for kk, vv in v.items()}
-            else:
-                serializable_enc[k] = v
-        config["encoders"] = serializable_enc
+        # Convert encoders to serializable format
+        config["encoders"] = {k: v for k, v in encoders.items()}
     if metrics.get("feature_names"):
         config["feature_names"] = metrics["feature_names"]
+    # terme de correction de biais (optionnel)
     if "Bias_train" in metrics:
         config["bias_correction"] = -metrics["Bias_train"]
     if training_features_path is not None:
@@ -601,12 +329,6 @@ def save_artifacts(
     with open(config_file, "w") as f:
         json.dump(config, f, indent=2)
 
-    # Save feature importance
-    if feature_importance is not None and not feature_importance.empty:
-        fi_file = METRICS_PATH / f"feature_importance_{today}.csv"
-        feature_importance.to_csv(fi_file, index=False)
-        logger.info("[train] Feature importance saved: %s", fi_file)
-
     return model_file, metrics_file
 
 
@@ -615,67 +337,64 @@ def save_artifacts(
 # ---------------------------------------------------------------------------
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Train sales prediction model")
+    parser = argparse.ArgumentParser(description="Train XGBoost sales prediction model")
     parser.add_argument("--lags", default=None, help=f"Comma-separated lag values (default: {PREDICT_LAGS})")
     parser.add_argument("--windows", default=None, help=f"Comma-separated rolling window sizes (default: {PREDICT_WINDOWS})")
-    parser.add_argument("--horizon", type=int, default=60, help="Test horizon in unique dates (default: 60)")
-    parser.add_argument("--tune", action="store_true", help="Run Optuna hyperparameter tuning")
-    parser.add_argument("--n-trials", type=int, default=50, help="Number of Optuna trials (default: 50)")
+    parser.add_argument("--horizon", type=int, default=30, help="Test horizon in unique dates (default: 30)")
+    parser.add_argument("--n-estimators", type=int, default=300)
+    parser.add_argument("--max-depth", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=0.05)
+    parser.add_argument("--reg-alpha", type=float, default=0.5)
+    parser.add_argument("--reg-lambda", type=float, default=2.0)
+    parser.add_argument("--subsample", type=float, default=0.8)
+    parser.add_argument("--colsample-bytree", type=float, default=0.8)
+    parser.add_argument("--min-child-weight", type=int, default=3)
     parser.add_argument("--tag", default="baseline")
-    parser.add_argument("--ensemble", action="store_true", help="Train LightGBM + XGBoost ensemble")
     args = parser.parse_args(argv)
 
     lags = _parse_int_list(args.lags) if args.lags else PREDICT_LAGS
     windows = _parse_int_list(args.windows) if args.windows else PREDICT_WINDOWS
     horizon = args.horizon
 
-    # Find the best data source
     features_path = FEATURES_PATH
-    if not features_path.exists():
-        # Try to use interim cleaned data
-        if INTERIM_PATH.exists():
-            logger.info("[train] Using interim data: %s", INTERIM_PATH)
-            features_path = INTERIM_PATH
-        else:
-            # Fallback
-            fallback = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
-            if fallback.exists():
-                features_path = fallback
-            else:
-                logger.error("[train] No data file found. Run data pipeline first.")
-                return 1
-
     logger.info("[train] Loading features from %s", features_path)
     logger.info("[train] Config: lags=%s, windows=%s, horizon=%d", lags, windows, horizon)
 
-    # Load and prepare
+    # Support a fallback features file when the primary training CSV is absent
+    if not features_path.exists():
+        fallback = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
+        if fallback.exists():
+            logger.warning("[train] Primary features file not found. Falling back to %s", fallback)
+            features_path = fallback
+        else:
+            logger.error("[train] Features file not found at %s", features_path)
+            logger.error("[train] Run the feature pipeline first: python -m src.data.features")
+            return 1
+
+    # Load and prepare (group-aware, NO aggregation)
     df, encoders = load_and_prepare(features_path, lags=lags, windows=windows)
     logger.info("[train] Dataset shape after feature engineering: %s", df.shape)
     logger.info(
         "[train] Target stats: mean=%.2f, std=%.2f, min=%.2f, max=%.2f",
-        df["value"].mean(), df["value"].std(), df["value"].min(), df["value"].max(),
+        df["value"].mean(),
+        df["value"].std(),
+        df["value"].min(),
+        df["value"].max(),
     )
 
     if len(df) <= horizon:
         logger.error("[train] Not enough data (%d rows) for horizon=%d", len(df), horizon)
         return 1
 
-    # Split
+    # Detect group cols for splitting
+    available_groups = [c for c in GROUP_COLS if c in df.columns]
+
+    # Split (date-based cutoff, keeps all groups in both train and test)
     X_train, y_train, X_test, y_test, dates_test = split_time_series(
-        df, horizon=horizon, exclude_cols=FEATURE_EXCLUDE,
+        df, horizon=horizon, exclude_cols=FEATURE_EXCLUDE, group_cols=available_groups
     )
     logger.info("[train] Train: %d samples, Test: %d samples", len(y_train), len(y_test))
-    logger.info("[train] Feature columns (%d): %s", X_train.shape[1], list(X_train.columns)[:20])
-    if X_train.shape[1] > 20:
-        logger.info("[train] ... and %d more features", X_train.shape[1] - 20)
-
-    # Create a validation set from end of training data for early stopping
-    val_size = max(int(len(X_train) * 0.15), horizon)
-    X_tr = X_train.iloc[:-val_size]
-    y_tr = y_train.iloc[:-val_size]
-    X_val = X_train.iloc[-val_size:]
-    y_val = y_train.iloc[-val_size:]
-    logger.info("[train] Train/Val split: %d / %d for early stopping", len(X_tr), len(X_val))
+    logger.info("[train] Feature columns (%d): %s", X_train.shape[1], list(X_train.columns))
 
     # Full feature set for CV
     exclude_cols = set(FEATURE_EXCLUDE) | {"value", "date"}
@@ -683,92 +402,32 @@ def main(argv=None) -> int:
     X_all = df[feature_cols].copy()
     y_all = df["value"].copy()
 
-    # Try LightGBM first, fallback to XGBoost
-    use_lgbm = True
-    try:
-        import lightgbm  # noqa: F401
-    except ImportError:
-        use_lgbm = False
-        logger.info("[train] LightGBM not available, using XGBoost only")
-
-    # Hyperparameter tuning
-    if args.tune:
-        logger.info("[train] Starting Optuna hyperparameter tuning (%d trials)...", args.n_trials)
-        if use_lgbm:
-            lgbm_params = tune_lgbm(X_train, y_train, n_trials=args.n_trials)
-        xgb_params = tune_xgb(X_train, y_train, n_trials=max(args.n_trials // 2, 20))
-    else:
-        lgbm_params = _default_lgbm_params() if use_lgbm else None
-        xgb_params = _default_xgb_params()
-
-    # Train model(s)
-    models = []
-    model_names = []
-
-    if use_lgbm:
-        logger.info("[train] Training LightGBM...")
-        lgbm_model = train_lgbm(X_tr, y_tr, X_val, y_val, lgbm_params)
-        models.append(lgbm_model)
-        model_names.append("LightGBM")
-
-        # Show LightGBM test score
-        lgbm_pred = lgbm_model.predict(X_test)
-        lgbm_r2 = r2_score(y_test, lgbm_pred)
-        lgbm_mae = mean_absolute_error(y_test, lgbm_pred)
-        logger.info("[train] LightGBM test -> MAE=%.4f, R2=%.4f", lgbm_mae, lgbm_r2)
-
-    if args.ensemble or not use_lgbm:
-        logger.info("[train] Training XGBoost...")
-        xgb_model = train_xgb(X_tr, y_tr, X_val, y_val, xgb_params)
-        models.append(xgb_model)
-        model_names.append("XGBoost")
-
-        xgb_pred = xgb_model.predict(X_test)
-        xgb_r2 = r2_score(y_test, xgb_pred)
-        xgb_mae = mean_absolute_error(y_test, xgb_pred)
-        logger.info("[train] XGBoost test -> MAE=%.4f, R2=%.4f", xgb_mae, xgb_r2)
-
-    # Select or ensemble
-    if len(models) > 1:
-        # Use ensemble with optimized weights based on validation performance
-        val_maes = []
-        for m in models:
-            pred = m.predict(X_val)
-            val_maes.append(mean_absolute_error(y_val, pred))
-
-        # Inverse MAE as weights (better model gets higher weight)
-        inv_maes = [1.0 / m for m in val_maes]
-        total = sum(inv_maes)
-        weights = [w / total for w in inv_maes]
-
-        model = EnsembleRegressor(models, weights)
-        logger.info("[train] Ensemble weights: %s = %s", model_names, [f"{w:.3f}" for w in weights])
-        tag = "ensemble"
-    else:
-        model = models[0]
-        tag = args.tag
+    # Train
+    model = train_model(
+        X_train, y_train,
+        n_estimators=args.n_estimators,
+        max_depth=args.max_depth,
+        learning_rate=args.learning_rate,
+        reg_alpha=args.reg_alpha,
+        reg_lambda=args.reg_lambda,
+        subsample=args.subsample,
+        colsample_bytree=args.colsample_bytree,
+        min_child_weight=args.min_child_weight,
+    )
 
     # Evaluate
     metrics = evaluate_model(model, X_train, y_train, X_test, y_test, X_all, y_all)
 
-    # Feature importance
-    fi = get_feature_importance(model, list(X_train.columns))
-    if not fi.empty:
-        logger.info("[train] Top 10 features:")
-        for _, row in fi.head(10).iterrows():
-            logger.info("[train]   %s: %.4f", row["feature"], row["importance"])
-
-    # Save
+    # Save (include encoders so predict can reuse them)
     model_file, metrics_file = save_artifacts(
-        model, metrics, encoders=encoders, tag=tag, lags=lags, windows=windows,
-        training_features_path=str(features_path), feature_importance=fi,
+        model, metrics, encoders=encoders, tag=args.tag, lags=lags, windows=windows,
+        training_features_path=str(features_path)
     )
 
     # Print results
     print(f"\n{'='*60}")
     print(f"[train] Model saved: {model_file}")
     print(f"[train] Metrics saved: {metrics_file}")
-    print(f"[train] Model type: {', '.join(model_names)}")
     print(f"{'='*60}")
     print(f"  Train  -> MAE={metrics['MAE_train']:.4f}  RMSE={metrics['RMSE_train']:.4f}  R2={metrics['R2_train']:.4f}")
     print(f"  Test   -> MAE={metrics['MAE_test']:.4f}  RMSE={metrics['RMSE_test']:.4f}  R2={metrics['R2_test']:.4f}")
@@ -777,28 +436,17 @@ def main(argv=None) -> int:
         print(f"  MAPE   -> {metrics['MAPE_test']:.2f}%")
     print(f"  sMAPE  -> {metrics['sMAPE_test']:.2f}%")
     print(f"  Overfit ratio (RMSE_test/RMSE_train): {metrics['overfit_ratio']:.2f}")
-    print(f"  CV     -> MAE={metrics['CV_mae_mean']:.4f} (+/- {metrics['CV_mae_std']:.4f})")
-    print(f"  CV     -> R2={metrics['CV_r2_mean']:.4f} (+/- {metrics['CV_r2_std']:.4f})")
+    print(f"  CV     -> MAE={metrics['CV_mae_mean']:.4f}  RMSE={metrics['CV_rmse_mean']:.4f}  R2={metrics['CV_r2_mean']:.4f}")
     print(f"{'='*60}")
 
-    # Verdict
-    r2_test = metrics["R2_test"]
-    if r2_test >= 0.85:
-        print("  VERDICT: Excellent model -- strong predictive power.")
-    elif r2_test >= 0.7:
-        print("  VERDICT: Good model -- explains significant variance.")
-    elif r2_test >= 0.5:
-        print("  VERDICT: Moderate model -- captures key patterns.")
-    elif r2_test >= 0.3:
-        print("  VERDICT: Weak model -- limited signal captured.")
-    else:
-        print("  VERDICT: Poor model -- needs better data or features.")
-
+    # Warnings
     if metrics["overfit_ratio"] > 2.0:
-        print("  WARNING: Significant overfitting detected (ratio > 2.0)")
+        print("[train] WARNING: Significant overfitting detected (ratio > 2.0)")
+    if metrics["R2_test"] < 0:
+        print("[train] WARNING: Negative R2 on test -- model is worse than predicting the mean")
     if abs(metrics["Bias_test"]) > df["value"].std() * 0.2:
         direction = "over" if metrics["Bias_test"] > 0 else "under"
-        print(f"  WARNING: Systematic {direction}-prediction detected (bias={metrics['Bias_test']:.4f})")
+        print(f"[train] WARNING: Systematic {direction}-prediction detected (bias={metrics['Bias_test']:.4f})")
 
     return 0
 

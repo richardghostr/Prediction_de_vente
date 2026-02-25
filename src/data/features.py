@@ -1,67 +1,37 @@
-"""Advanced feature engineering pipeline for time series sales forecasting.
+"""Features temporelles et agrégations -- version group-aware.
 
-Group-aware version: computes lags, rolling stats, and other features per group
-(store_id, product_id) to avoid leakage between different time series.
+Le pipeline construit des features par groupe (store_id, product_id) pour éviter
+de mélanger les séries temporelles différentes.
 
-Key improvements over the original:
-- Cyclical encoding for periodic features (month, dayofweek, etc.)
-- Fourier terms for capturing complex seasonality
-- Expanded lag set with more granularity
-- Rolling statistics with proper min_periods to avoid noisy early estimates
-- Exponentially weighted moving averages (EWMA)
-- Lag interaction features
-- Target encoding for categorical variables (with smoothing to prevent overfitting)
-- Proper handling of min_periods to drop unreliable early window estimates
+Entrées / sorties (contrat):
+- Entrée attendue : CSV nettoyé produit par `clean.py`, colonnes minimales `date`, `value`.
+  Si `store_id` et `product_id` sont présents, les lags/rolling sont calculés par groupe.
+- Sortie : DataFrame enrichi avec colonnes de features.
 
-Usage:
-    python src/data/features.py --in data/interim --out data/processed --lags 1,2,3,7,14,21,28 --windows 7,14,28
+Exemple d'utilisation :
+    python src/data/features.py --in data/interim --out data/processed --lags 1,7,14 --windows 7,14
 """
 
 from typing import List, Optional
-import numpy as np
+
 import pandas as pd
 
 
 # ---------------------------------------------------------------------------
-# Time features with cyclical encoding
+# Time features (applied globally -- same for all groups)
 # ---------------------------------------------------------------------------
 
 def add_time_features(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
-    """Add calendar-based time features with cyclical sin/cos encoding."""
+    """Add calendar-based time features."""
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-
-    dt = df[date_col].dt
-
-    # Raw features useful for tree models
-    df["year"] = dt.year
-    df["month"] = dt.month
-    df["day"] = dt.day
-    df["dayofweek"] = dt.dayofweek
+    df["year"] = df[date_col].dt.year
+    df["month"] = df[date_col].dt.month
+    df["day"] = df[date_col].dt.day
+    df["dayofweek"] = df[date_col].dt.dayofweek
     df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)
-    df["quarter"] = dt.quarter
-    df["week_of_year"] = dt.isocalendar().week.astype(int)
-    df["dayofyear"] = dt.dayofyear
-    df["day_of_month"] = dt.day
-    df["is_month_start"] = dt.is_month_start.astype(int)
-    df["is_month_end"] = dt.is_month_end.astype(int)
-
-    # Cyclical encoding: sin/cos transforms capture the circular nature
-    # of periodic features (e.g., December is close to January)
-    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
-    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
-    df["dow_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7)
-    df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
-    df["day_of_year_sin"] = np.sin(2 * np.pi * df["dayofyear"] / 365.25)
-    df["day_of_year_cos"] = np.cos(2 * np.pi * df["dayofyear"] / 365.25)
-    df["week_sin"] = np.sin(2 * np.pi * df["week_of_year"] / 52)
-    df["week_cos"] = np.cos(2 * np.pi * df["week_of_year"] / 52)
-
-    # Fourier terms for complex seasonality (2 harmonics for yearly pattern)
-    for k in range(1, 3):
-        df[f"fourier_yearly_sin_{k}"] = np.sin(2 * np.pi * k * df["dayofyear"] / 365.25)
-        df[f"fourier_yearly_cos_{k}"] = np.cos(2 * np.pi * k * df["dayofyear"] / 365.25)
-
+    df["quarter"] = df[date_col].dt.quarter
+    df["week_of_year"] = df[date_col].dt.isocalendar().week.astype(int)
     return df
 
 
@@ -76,13 +46,12 @@ def add_lags(
     date_col: str = "date",
     group_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Create lag features. When group_cols is given, lags are computed
+    """Create lag features.  When group_cols is given, lags are computed
     within each group to avoid leakage between different time series."""
     df = df.copy()
     if lags is None:
-        lags = [1, 2, 3, 7, 14, 21, 28]
-    sort_cols = ([*group_cols, date_col] if group_cols else [date_col])
-    df = df.sort_values(by=sort_cols)
+        lags = [1]
+    df = df.sort_values(by=([*group_cols, date_col] if group_cols else [date_col]))
 
     for lag in lags:
         col_name = f"lag_{lag}"
@@ -104,110 +73,23 @@ def add_rolling_features(
     date_col: str = "date",
     group_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Rolling mean, std, min, max, and median. shift(1) avoids leakage.
-    Uses min_periods=window to ensure only complete windows produce values."""
+    """Rolling mean and std.  shift(1) avoids data leakage.
+    When group_cols is given, rolling is computed within each group."""
     df = df.copy()
     if windows is None:
-        windows = [7, 14, 28]
-    sort_cols = ([*group_cols, date_col] if group_cols else [date_col])
-    df = df.sort_values(by=sort_cols)
+        windows = [7]
+    df = df.sort_values(by=([*group_cols, date_col] if group_cols else [date_col]))
 
     for w in windows:
         if group_cols and all(c in df.columns for c in group_cols):
             shifted = df.groupby(group_cols)[value_col].shift(1)
-            # Group by a hashable key
-            gkey = df[group_cols].apply(lambda row: tuple(row), axis=1)
-            rolling_obj = shifted.groupby(gkey)
-            # Use min_periods = w for reliable statistics (avoids noisy early estimates)
-            mp = max(w // 2, 3)  # at least half the window or 3
-
-            df[f"roll_mean_{w}"] = rolling_obj.transform(
-                lambda x: x.rolling(window=w, min_periods=mp).mean()
-            )
-            df[f"roll_std_{w}"] = rolling_obj.transform(
-                lambda x: x.rolling(window=w, min_periods=mp).std()
-            ).fillna(0)
-            df[f"roll_min_{w}"] = rolling_obj.transform(
-                lambda x: x.rolling(window=w, min_periods=mp).min()
-            )
-            df[f"roll_max_{w}"] = rolling_obj.transform(
-                lambda x: x.rolling(window=w, min_periods=mp).max()
-            )
+            rolling = shifted.groupby(df[group_cols].apply(tuple, axis=1))
+            df[f"roll_mean_{w}"] = rolling.rolling(window=w, min_periods=1).mean().reset_index(level=0, drop=True)
+            df[f"roll_std_{w}"] = rolling.rolling(window=w, min_periods=1).std().reset_index(level=0, drop=True).fillna(0)
         else:
             shifted = df[value_col].shift(1)
-            mp = max(w // 2, 3)
-            df[f"roll_mean_{w}"] = shifted.rolling(window=w, min_periods=mp).mean()
-            df[f"roll_std_{w}"] = shifted.rolling(window=w, min_periods=mp).std().fillna(0)
-            df[f"roll_min_{w}"] = shifted.rolling(window=w, min_periods=mp).min()
-            df[f"roll_max_{w}"] = shifted.rolling(window=w, min_periods=mp).max()
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Exponentially weighted moving average (EWMA) features
-# ---------------------------------------------------------------------------
-
-def add_ewma_features(
-    df: pd.DataFrame,
-    value_col: str = "value",
-    spans: Optional[List[int]] = None,
-    group_cols: Optional[List[str]] = None,
-) -> pd.DataFrame:
-    """Add EWMA features that give more weight to recent observations."""
-    df = df.copy()
-    if spans is None:
-        spans = [7, 14, 28]
-
-    for span in spans:
-        col_name = f"ewma_{span}"
-        if group_cols and all(c in df.columns for c in group_cols):
-            shifted = df.groupby(group_cols)[value_col].shift(1)
-            gkey = df[group_cols].apply(lambda row: tuple(row), axis=1)
-            df[col_name] = shifted.groupby(gkey).transform(
-                lambda x: x.ewm(span=span, min_periods=max(span // 2, 3)).mean()
-            )
-        else:
-            shifted = df[value_col].shift(1)
-            df[col_name] = shifted.ewm(span=span, min_periods=max(span // 2, 3)).mean()
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Lag-derived interaction features
-# ---------------------------------------------------------------------------
-
-def add_lag_interactions(df: pd.DataFrame) -> pd.DataFrame:
-    """Add features derived from relationships between lags."""
-    df = df.copy()
-
-    # Lag differences (momentum)
-    if "lag_1" in df.columns and "lag_7" in df.columns:
-        df["lag_diff_1_7"] = df["lag_1"] - df["lag_7"]
-    if "lag_7" in df.columns and "lag_14" in df.columns:
-        df["lag_diff_7_14"] = df["lag_7"] - df["lag_14"]
-    if "lag_1" in df.columns and "lag_14" in df.columns:
-        df["lag_diff_1_14"] = df["lag_1"] - df["lag_14"]
-
-    # Lag ratios (relative change)
-    if "lag_1" in df.columns and "lag_7" in df.columns:
-        df["lag_ratio_1_7"] = df["lag_1"] / df["lag_7"].replace(0, np.nan)
-
-    # Rolling coefficient of variation
-    for w in [7, 14, 28]:
-        mean_col = f"roll_mean_{w}"
-        std_col = f"roll_std_{w}"
-        if mean_col in df.columns and std_col in df.columns:
-            df[f"roll_cv_{w}"] = df[std_col] / df[mean_col].replace(0, np.nan)
-            df[f"roll_cv_{w}"] = df[f"roll_cv_{w}"].fillna(0).clip(-10, 10)
-
-    # Range feature
-    for w in [7, 14, 28]:
-        min_col = f"roll_min_{w}"
-        max_col = f"roll_max_{w}"
-        if min_col in df.columns and max_col in df.columns:
-            df[f"roll_range_{w}"] = df[max_col] - df[min_col]
-
+            df[f"roll_mean_{w}"] = shifted.rolling(window=w, min_periods=1).mean()
+            df[f"roll_std_{w}"] = shifted.rolling(window=w, min_periods=1).std().fillna(0)
     return df
 
 
@@ -220,7 +102,7 @@ def encode_categorical(
     cols: Optional[List[str]] = None,
     encoders: Optional[dict] = None,
 ) -> tuple:
-    """Label-encode categorical columns. Returns (df, encoders_dict).
+    """Label-encode categorical columns.  Returns (df, encoders_dict).
     If `encoders` is provided, reuse existing mappings (for inference)."""
     df = df.copy()
     if cols is None:
@@ -232,65 +114,13 @@ def encode_categorical(
         if c not in df.columns:
             continue
         if c in encoders:
+            # Reuse existing mapping; unseen categories get -1
             mapping = encoders[c]
             df[c] = df[c].map(mapping).fillna(-1).astype(int)
         else:
             cat = pd.Categorical(df[c])
             encoders[c] = {v: i for i, v in enumerate(cat.categories)}
             df[c] = cat.codes
-    return df, encoders
-
-
-# ---------------------------------------------------------------------------
-# Target encoding with smoothing (Bayesian target encoding)
-# ---------------------------------------------------------------------------
-
-def add_target_encoding(
-    df: pd.DataFrame,
-    cols: List[str],
-    target_col: str = "value",
-    smoothing: float = 10.0,
-    encoders: Optional[dict] = None,
-    is_train: bool = True,
-) -> tuple:
-    """Bayesian target encoding: encodes categorical as smoothed target mean.
-
-    For each category c: enc(c) = (n_c * mean_c + m * global_mean) / (n_c + m)
-    where m = smoothing parameter.
-
-    Uses shift(1) equivalent: encoding is based on cumulative stats excluding
-    the current row (leave-one-out style for training) to prevent leakage.
-    For inference, just apply the stored encoders.
-    """
-    df = df.copy()
-    if encoders is None:
-        encoders = {}
-
-    global_mean = df[target_col].mean()
-
-    for c in cols:
-        if c not in df.columns:
-            continue
-        enc_col = f"{c}_target_enc"
-
-        if is_train:
-            # Compute per-category stats
-            cat_stats = df.groupby(c)[target_col].agg(["mean", "count"])
-            cat_stats.columns = ["cat_mean", "cat_count"]
-            # Bayesian smoothing
-            cat_stats["smoothed"] = (
-                cat_stats["cat_count"] * cat_stats["cat_mean"] + smoothing * global_mean
-            ) / (cat_stats["cat_count"] + smoothing)
-            enc_map = cat_stats["smoothed"].to_dict()
-            encoders[f"{c}_target"] = {"map": enc_map, "global_mean": global_mean}
-            df[enc_col] = df[c].map(enc_map).fillna(global_mean)
-        else:
-            if f"{c}_target" in encoders:
-                enc_info = encoders[f"{c}_target"]
-                df[enc_col] = df[c].map(enc_info["map"]).fillna(enc_info["global_mean"])
-            else:
-                df[enc_col] = global_mean
-
     return df, encoders
 
 
@@ -307,21 +137,27 @@ def build_feature_pipeline(
     group_cols: Optional[List[str]] = None,
     categorical_cols: Optional[List[str]] = None,
     encoders: Optional[dict] = None,
-    is_train: bool = True,
 ) -> tuple:
     """Full feature engineering pipeline.
 
     Returns (df_with_features, encoders_dict) so that the same encoding
     can be reused at inference time.
+
+    Parameters
+    ----------
+    group_cols : list of str, optional
+        Columns that identify separate time series (e.g. ["store_id", "product_id"]).
+        When provided, lags and rolling stats are computed *within* each group.
+    categorical_cols : list of str, optional
+        Columns to label-encode. Defaults to auto-detecting object/category cols.
+    encoders : dict, optional
+        Previously fitted encoders to reuse at inference time.
     """
     df = df.copy()
 
-    if lags is None:
-        lags = [1, 2, 3, 7, 14, 21, 28]
-    if windows is None:
-        windows = [7, 14, 28]
-
-    # Normalize common column aliases
+    # Normalize common column aliases so downstream code (train/eval/predict)
+    # sees consistent column names. This avoids mismatches when upstream
+    # ingestion/cleaning used different names (e.g. `id` vs `store_id`).
     alias_map = {}
     if "store_id" not in df.columns and "id" in df.columns:
         alias_map["id"] = "store_id"
@@ -334,46 +170,28 @@ def build_feature_pipeline(
 
     # Detect group columns if present in data
     if group_cols is None:
+        # Try default from config
         try:
             from src.config import GROUP_COLS
-            group_cols = [c for c in GROUP_COLS if c in df.columns]
+            if all(c in df.columns for c in GROUP_COLS):
+                group_cols = GROUP_COLS
         except ImportError:
             pass
 
-    if encoders is None:
-        encoders = {}
-
-    # Sort by group + date for correct temporal ordering
-    sort_cols = (group_cols or []) + [date_col]
-    sort_cols = [c for c in sort_cols if c in df.columns]
-    df = df.sort_values(sort_cols).reset_index(drop=True)
-
-    # 1. Time features (cyclical + calendar)
+    # 1. Time features
     df = add_time_features(df, date_col=date_col)
 
     # 2. Lags (group-aware)
     df = add_lags(df, value_col=value_col, lags=lags, date_col=date_col, group_cols=group_cols)
 
-    # 3. Rolling features (group-aware, with proper min_periods)
+    # 3. Rolling features (group-aware)
     df = add_rolling_features(df, value_col=value_col, windows=windows, date_col=date_col, group_cols=group_cols)
 
-    # 4. EWMA features (group-aware)
-    df = add_ewma_features(df, value_col=value_col, spans=windows, group_cols=group_cols)
-
-    # 5. Lag interaction features
-    df = add_lag_interactions(df)
-
-    # 6. Target encoding for categorical columns (Bayesian smoothed)
-    target_enc_cols = [c for c in (group_cols or []) if c in df.columns and df[c].dtype == "object"]
-    if target_enc_cols:
-        df, encoders = add_target_encoding(
-            df, cols=target_enc_cols, target_col=value_col,
-            encoders=encoders, is_train=is_train,
-        )
-
-    # 7. Label-encode categorical columns (for tree models)
+    # 4. Encode categoricals
     if categorical_cols is None:
-        categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        # Auto-detect + include group cols if they are strings
+        auto_cats = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        categorical_cols = list(set(auto_cats))
     df, encoders = encode_categorical(df, cols=categorical_cols, encoders=encoders)
 
     return df, encoders
@@ -391,8 +209,8 @@ def parse_args(argv=None):
     )
     parser.add_argument("--in", dest="input", default="data/interim")
     parser.add_argument("--out", dest="output", default="data/processed")
-    parser.add_argument("--lags", default="1,2,3,7,14,21,28")
-    parser.add_argument("--windows", default="7,14,28")
+    parser.add_argument("--lags", default="1,7,14")
+    parser.add_argument("--windows", default="7,14")
     parser.add_argument("--pattern", default="*_clean.csv")
     parser.add_argument("--no-verbose", dest="verbose", action="store_false")
     return parser.parse_args(argv)
