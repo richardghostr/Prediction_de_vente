@@ -195,7 +195,6 @@ def predict_series(
     # Get encoders & éventuelle correction de biais depuis la config
     encoders = config.get("encoders")
     bias_correction = float(config.get("bias_correction", 0.0))
-    target_transform = config.get("target_transform")
 
     try:
         from src.data.features import build_feature_pipeline
@@ -249,7 +248,7 @@ def predict_series(
 
     for step in range(1, horizon + 1):
         try:
-            result = build_feature_pipeline(
+            feats, _ = build_feature_pipeline(
                 history,
                 date_col="date",
                 value_col="value",
@@ -259,14 +258,6 @@ def predict_series(
                 categorical_cols=cat_cols if cat_cols else None,
                 encoders=encoders,
             )
-            if isinstance(result, tuple) and len(result) == 2:
-                feats, _enc = result
-            else:
-                feats = result
-                _enc = getattr(feats, "attrs", {}).get("encoders", None)
-            # prefer encoders from model config, else use pipeline encoders
-            if encoders is None and _enc:
-                encoders = _enc
         except Exception:
             feats = None
 
@@ -281,12 +272,7 @@ def predict_series(
             else:
                 X_last = X_clean.iloc[[-1]]
                 X_last = _align_features_to_model(X_last, model)
-                raw_pred = float(model.predict(X_last)[0])
-                # If model was trained on a transformed target, invert transform
-                if target_transform == "log1p":
-                    raw = float(np.expm1(raw_pred))
-                else:
-                    raw = raw_pred
+                raw = float(model.predict(X_last)[0])
                 # applique la correction de biais si définie dans la config
                 raw_corrected = raw + bias_correction
                 yhat = raw_corrected if math.isfinite(raw_corrected) else float(last_val)

@@ -101,14 +101,9 @@ def encode_categorical(
     df: pd.DataFrame,
     cols: Optional[List[str]] = None,
     encoders: Optional[dict] = None,
-) -> pd.DataFrame:
-    """Label-encode categorical columns.
-
-    Applies label-encoding and stores the mapping dictionary into
-    `df.attrs['encoders']` so callers can retrieve encoders if needed.
-    If `encoders` is provided, reuse existing mappings (for inference).
-    Returns the transformed DataFrame.
-    """
+) -> tuple:
+    """Label-encode categorical columns.  Returns (df, encoders_dict).
+    If `encoders` is provided, reuse existing mappings (for inference)."""
     df = df.copy()
     if cols is None:
         cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
@@ -126,12 +121,7 @@ def encode_categorical(
             cat = pd.Categorical(df[c])
             encoders[c] = {v: i for i, v in enumerate(cat.categories)}
             df[c] = cat.codes
-    # Persist encoders into DataFrame attrs for downstream retrieval
-    try:
-        df.attrs["encoders"] = encoders
-    except Exception:
-        pass
-    return df
+    return df, encoders
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +192,9 @@ def build_feature_pipeline(
         # Auto-detect + include group cols if they are strings
         auto_cats = df.select_dtypes(include=["object", "category"]).columns.tolist()
         categorical_cols = list(set(auto_cats))
-    df = encode_categorical(df, cols=categorical_cols, encoders=encoders)
-    # retrieve encoders saved on the DataFrame if any
-    enc = df.attrs.get("encoders", {}) if isinstance(df, pd.DataFrame) else {}
-    return df
+    df, encoders = encode_categorical(df, cols=categorical_cols, encoders=encoders)
+
+    return df, encoders
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +244,7 @@ def main(argv=None) -> int:
                 print(f"[features] ignore {f} : {e}")
                 continue
 
-            feat = build_feature_pipeline(df, lags=lags, windows=windows)
+            feat, _ = build_feature_pipeline(df, lags=lags, windows=windows)
             out_name = f"{f.stem.replace('_clean', '')}_features{f.suffix}"
             outp = outd / out_name
             feat.to_csv(outp, index=False)

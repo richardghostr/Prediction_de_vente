@@ -101,20 +101,13 @@ def load_and_prepare(
     cat_cols = [c for c in CATEGORICAL_FEATURES if c in df.columns]
 
     # Run the group-aware feature pipeline
-    # build_feature_pipeline may return a DataFrame or (df, encoders); handle both
-    result = build_feature_pipeline(
+    df, encoders = build_feature_pipeline(
         df,
         lags=lags,
         windows=windows,
         group_cols=available_groups if available_groups else None,
         categorical_cols=cat_cols if cat_cols else None,
-        encoders=None,
     )
-    if isinstance(result, tuple) and len(result) == 2:
-        df, encoders = result
-    else:
-        df = result
-        encoders = (df.attrs.get("encoders") if hasattr(df, "attrs") else {}) or {}
 
     # Drop rows with NaN introduced by lags/rolling (first rows per group)
     before = len(df)
@@ -122,41 +115,6 @@ def load_and_prepare(
     after = len(df)
     if before != after:
         logger.info("[train] Dropped %d NaN rows (from lags/rolling warm-up)", before - after)
-<<<<<<< HEAD
-        try:
-            drop_pct = 100.0 * (before - after) / before if before > 0 else 0.0
-            logger.info("[train] Percent rows dropped after feature-engineering: %.2f%%", drop_pct)
-            # Per-group drop diagnostics (if group columns present)
-            if available_groups:
-                orig_counts = df.groupby(available_groups).size()
-                # to compute original per-group counts, rebuild before-drop frame
-                # re-run pipeline without dropna to get pre-drop grouping
-                try:
-                    _src_df = pd.read_csv(path, parse_dates=["date"]) if isinstance(path, Path) else None
-                    result_full = build_feature_pipeline(
-                        _src_df,
-                        lags=lags,
-                        windows=windows,
-                        group_cols=available_groups,
-                        categorical_cols=cat_cols if cat_cols else None,
-                    )
-                    if isinstance(result_full, tuple) and len(result_full) == 2:
-                        df_full, _ = result_full
-                    else:
-                        df_full = result_full
-                    pre_counts = df_full.groupby(available_groups).size()
-                    # align indices
-                    merged = (pre_counts.to_frame("pre").join(orig_counts.to_frame("post"), how="left").fillna(0))
-                    merged["pct_dropped"] = 100.0 * (merged["pre"] - merged["post"]) / merged["pre"].replace(0, 1)
-                    top = merged.sort_values("pct_dropped", ascending=False).head(5)
-                    logger.info("[train] Top groups by %% rows dropped after features: %s", top["pct_dropped"].to_dict())
-                except Exception:
-                    # best-effort diagnostics; ignore failures
-                    pass
-        except Exception:
-            pass
-=======
->>>>>>> 9fcbb8d36aedbb58bdba22e979eabd214f45666e
 
     return df, encoders
 
@@ -164,63 +122,38 @@ def load_and_prepare(
 def split_time_series(
     df: pd.DataFrame,
     horizon: int,
-    val_horizon: Optional[int] = None,
     date_col: str = "date",
     target_col: str = "value",
     exclude_cols: Optional[set] = None,
     group_cols: Optional[List[str]] = None,
-) -> Tuple[pd.DataFrame, pd.Series, Optional[pd.DataFrame], Optional[pd.Series], pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
-    """Split into train / val / test respecting temporal order.
+) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, pd.Series]:
+    """Split into train / test respecting temporal order.
 
-    For multi-group data: finds date cutoffs such that the last `horizon`
-    unique dates go to test, and optionally the `val_horizon` dates before
-    that go to validation. Returns (X_train, y_train, X_val, y_val,
-    X_test, y_test, dates_test, test_df) where X_val/y_val can be None if
-    val_horizon is not provided.
+    For multi-group data: finds a date cutoff such that the last `horizon`
+    unique dates go to test. This ensures all groups have test rows.
     """
     if exclude_cols is None:
         exclude_cols = set()
     exclude_cols = set(exclude_cols) | {target_col, date_col}
     feature_cols = [c for c in df.columns if c not in exclude_cols]
 
-    # Find unique dates and determine cutoffs
+    # Find date cutoff: last `horizon` unique dates -> test
     unique_dates = sorted(df[date_col].unique())
     if horizon >= len(unique_dates):
         horizon = max(1, len(unique_dates) // 5)
         logger.warning("[train] Adjusted horizon to %d (not enough unique dates)", horizon)
 
-    cutoff_test = unique_dates[-horizon]
-
-    cutoff_val = None
-    if val_horizon:
-        if (horizon + val_horizon) >= len(unique_dates):
-            val_horizon = max(1, (len(unique_dates) - horizon) // 5)
-            logger.warning("[train] Adjusted val_horizon to %d (not enough unique dates)", val_horizon)
-        cutoff_val = unique_dates[-(horizon + val_horizon)]
-
-    if cutoff_val is None:
-        train_mask = df[date_col] < cutoff_test
-        val_mask = pd.Series(False, index=df.index)
-    else:
-        train_mask = df[date_col] < cutoff_val
-        val_mask = (df[date_col] >= cutoff_val) & (df[date_col] < cutoff_test)
-
-    test_mask = df[date_col] >= cutoff_test
+    cutoff_date = unique_dates[-horizon]
+    train_mask = df[date_col] < cutoff_date
+    test_mask = df[date_col] >= cutoff_date
 
     X_train = df.loc[train_mask, feature_cols].copy()
     y_train = df.loc[train_mask, target_col].copy()
-
-    X_val = df.loc[val_mask, feature_cols].copy() if cutoff_val is not None else None
-    y_val = df.loc[val_mask, target_col].copy() if cutoff_val is not None else None
-
     X_test = df.loc[test_mask, feature_cols].copy()
     y_test = df.loc[test_mask, target_col].copy()
     dates_test = df.loc[test_mask, date_col].copy()
 
-    # Return the post-feature-engineered test slice for diagnostics
-    test_df = df.loc[test_mask].copy()
-
-    return X_train, y_train, X_val, y_val, X_test, y_test, dates_test, test_df
+    return X_train, y_train, X_test, y_test, dates_test
 
 
 def train_model(
@@ -265,14 +198,10 @@ def evaluate_model(
     X_all: pd.DataFrame,
     y_all: pd.Series,
     n_cv_splits: int = 5,
-    target_transform: Optional[str] = None,
 ) -> dict:
     """Evaluate with train/test/CV metrics including bias detection."""
     # Train metrics
     y_pred_train = model.predict(X_train)
-    # If model was trained on a transformed target, invert predictions for metrics
-    if target_transform == "log1p":
-        y_pred_train = np.expm1(y_pred_train)
     mae_train = mean_absolute_error(y_train, y_pred_train)
     rmse_train = sqrt(mean_squared_error(y_train, y_pred_train))
     r2_train = r2_score(y_train, y_pred_train)
@@ -280,8 +209,6 @@ def evaluate_model(
 
     # Test metrics
     y_pred_test = model.predict(X_test)
-    if target_transform == "log1p":
-        y_pred_test = np.expm1(y_pred_test)
     mae_test = mean_absolute_error(y_test, y_pred_test)
     rmse_test = sqrt(mean_squared_error(y_test, y_pred_test))
     r2_test = r2_score(y_test, y_pred_test)
@@ -299,19 +226,13 @@ def evaluate_model(
     denom_safe = np.where(denom > 0, denom, 1.0)
     smape_test = float(np.mean(np.abs(y_test.values - y_pred_test) / denom_safe) * 100)
 
-    # Cross-validation on TRAIN set only (avoid peeking at test)
-    tscv = TimeSeriesSplit(n_splits=min(n_cv_splits, max(2, len(X_train) // 50)))
+    # Cross-validation on full dataset
+    tscv = TimeSeriesSplit(n_splits=min(n_cv_splits, max(2, len(X_all) // 50)))
     cv_scores = {"mae": [], "rmse": [], "r2": []}
 
-    for train_idx, val_idx in tscv.split(X_train):
-        X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-        y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
-
-        # If a target transform was used during training, apply it for CV fitting
-        if target_transform == "log1p":
-            y_tr_fit = np.log1p(y_tr)
-        else:
-            y_tr_fit = y_tr
+    for train_idx, val_idx in tscv.split(X_all):
+        X_tr, X_val = X_all.iloc[train_idx], X_all.iloc[val_idx]
+        y_tr, y_val = y_all.iloc[train_idx], y_all.iloc[val_idx]
 
         model_cv = XGBRegressor(
             n_estimators=model.n_estimators,
@@ -324,10 +245,8 @@ def evaluate_model(
             min_child_weight=model.min_child_weight,
             random_state=42,
         )
-        model_cv.fit(X_tr, y_tr_fit)
+        model_cv.fit(X_tr, y_tr)
         y_val_pred = model_cv.predict(X_val)
-        if target_transform == "log1p":
-            y_val_pred = np.expm1(y_val_pred)
         cv_scores["mae"].append(float(mean_absolute_error(y_val, y_val_pred)))
         cv_scores["rmse"].append(float(sqrt(mean_squared_error(y_val, y_val_pred))))
         cv_scores["r2"].append(float(r2_score(y_val, y_val_pred)))
@@ -368,7 +287,6 @@ def save_artifacts(
     lags: Optional[List[int]] = None,
     windows: Optional[List[int]] = None,
     training_features_path: Optional[str] = None,
-    target_transform: Optional[str] = None,
 ) -> Tuple[Path, Path]:
     """Persist model, metrics, encoders, and feature config to disk.
 
@@ -390,28 +308,6 @@ def save_artifacts(
     with open(metrics_file, "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Save feature importances if available
-    try:
-        fi = None
-        feat_names = metrics.get("feature_names") if metrics else None
-        if hasattr(model, "feature_importances_") and feat_names:
-            fi = {str(n): float(v) for n, v in zip(feat_names, model.feature_importances_)}
-        else:
-            try:
-                booster = model.get_booster()
-                scores = booster.get_score(importance_type='weight')
-                fi = {k: float(v) for k, v in scores.items()}
-            except Exception:
-                fi = None
-        if fi:
-            fi_file = ARTIFACTS_PATH / (model_file.stem + "_feature_importances.json")
-            with open(fi_file, "w") as fh:
-                json.dump(fi, fh, indent=2)
-            # include path in metrics
-            metrics["feature_importances_file"] = str(fi_file)
-    except Exception:
-        pass
-
     # Save config (lags, windows, encoders) so predict.py uses the same settings
     config = {}
     if lags is not None:
@@ -426,26 +322,12 @@ def save_artifacts(
     # terme de correction de biais (optionnel)
     if "Bias_train" in metrics:
         config["bias_correction"] = -metrics["Bias_train"]
-    # Target transform used during training (if any)
-    if target_transform is not None:
-        config["target_transform"] = target_transform
     if training_features_path is not None:
         config["training_features_path"] = str(training_features_path)
 
     config_file = model_file.parent / (model_file.stem + "_config.json")
     with open(config_file, "w") as f:
         json.dump(config, f, indent=2)
-
-    # If group metrics present in metrics dict, save them separately for easier consumption
-    try:
-        if metrics.get("group_mae_top10"):
-            gm_file = METRICS_PATH / (model_file.stem + "_group_metrics.json")
-            METRICS_PATH.mkdir(parents=True, exist_ok=True)
-            with open(gm_file, "w") as fh:
-                json.dump(metrics.get("group_mae_top10"), fh, indent=2)
-            metrics["group_metrics_file"] = str(gm_file)
-    except Exception:
-        pass
 
     return model_file, metrics_file
 
@@ -459,7 +341,6 @@ def main(argv=None) -> int:
     parser.add_argument("--lags", default=None, help=f"Comma-separated lag values (default: {PREDICT_LAGS})")
     parser.add_argument("--windows", default=None, help=f"Comma-separated rolling window sizes (default: {PREDICT_WINDOWS})")
     parser.add_argument("--horizon", type=int, default=30, help="Test horizon in unique dates (default: 30)")
-    parser.add_argument("--val-horizon", type=int, default=0, help="Validation horizon in unique dates (default: 0 = no validation set)")
     parser.add_argument("--n-estimators", type=int, default=300)
     parser.add_argument("--max-depth", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=0.05)
@@ -469,13 +350,11 @@ def main(argv=None) -> int:
     parser.add_argument("--colsample-bytree", type=float, default=0.8)
     parser.add_argument("--min-child-weight", type=int, default=3)
     parser.add_argument("--tag", default="baseline")
-    parser.add_argument("--target-transform", default="none", choices=["none", "log1p"], help="Optional target transform to apply during training (default: none)")
     args = parser.parse_args(argv)
 
     lags = _parse_int_list(args.lags) if args.lags else PREDICT_LAGS
     windows = _parse_int_list(args.windows) if args.windows else PREDICT_WINDOWS
     horizon = args.horizon
-    val_horizon = args.val_horizon
 
     features_path = FEATURES_PATH
     logger.info("[train] Loading features from %s", features_path)
@@ -510,15 +389,11 @@ def main(argv=None) -> int:
     # Detect group cols for splitting
     available_groups = [c for c in GROUP_COLS if c in df.columns]
 
-    # Split (date-based cutoff, keeps all groups in both train/val/test)
-    X_train, y_train, X_val, y_val, X_test, y_test, dates_test, test_df = split_time_series(
-        df, horizon=horizon, val_horizon=(val_horizon if val_horizon > 0 else None), exclude_cols=FEATURE_EXCLUDE, group_cols=available_groups
+    # Split (date-based cutoff, keeps all groups in both train and test)
+    X_train, y_train, X_test, y_test, dates_test = split_time_series(
+        df, horizon=horizon, exclude_cols=FEATURE_EXCLUDE, group_cols=available_groups
     )
-<<<<<<< HEAD
-    logger.info("[train] Train: %d samples, Val: %s, Test: %d samples", len(y_train), (len(y_val) if y_val is not None else '0'), len(y_test))
-=======
     logger.info("[train] Train: %d samples, Test: %d samples", len(y_train), len(y_test))
->>>>>>> 9fcbb8d36aedbb58bdba22e979eabd214f45666e
     logger.info("[train] Feature columns (%d): %s", X_train.shape[1], list(X_train.columns))
 
     # Full feature set for CV
@@ -527,20 +402,9 @@ def main(argv=None) -> int:
     X_all = df[feature_cols].copy()
     y_all = df["value"].copy()
 
-    # Apply optional target transform
-    target_transform = args.target_transform
-    transform_info = {"type": None}
-    if target_transform == "log1p":
-        use_y_train = np.log1p(y_train)
-        use_y_all = np.log1p(y_all)
-        transform_info["type"] = "log1p"
-    else:
-        use_y_train = y_train
-        use_y_all = y_all
-
     # Train
     model = train_model(
-        X_train, use_y_train,
+        X_train, y_train,
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
         learning_rate=args.learning_rate,
@@ -551,47 +415,13 @@ def main(argv=None) -> int:
         min_child_weight=args.min_child_weight,
     )
 
-    # Optional: compute validation metrics if we have a validation split
-    val_metrics = None
-    try:
-        if X_val is not None and len(X_val) > 0:
-            y_pred_val = model.predict(X_val)
-            if transform_info["type"] == "log1p":
-                y_pred_val = np.expm1(y_pred_val)
-            val_mae = mean_absolute_error(y_val, y_pred_val)
-            val_rmse = sqrt(mean_squared_error(y_val, y_pred_val))
-            val_r2 = r2_score(y_val, y_pred_val)
-            val_metrics = {"MAE": float(val_mae), "RMSE": float(val_rmse), "R2": float(val_r2)}
-    except Exception:
-        val_metrics = None
-
-    # Evaluate (train/test and CV on train only)
-    metrics = evaluate_model(model, X_train, y_train, X_test, y_test, X_all, y_all, target_transform=transform_info["type"])
-    if val_metrics is not None:
-        metrics["val"] = val_metrics
-
-    # Per-group diagnostics on test set (top groups by MAE)
-    try:
-        if available_groups and 'test_df' in locals() and not test_df.empty:
-            y_pred_test = model.predict(X_test)
-            df_pred = test_df.copy()
-            df_pred["_y_true"] = y_test.values
-            df_pred["_y_pred"] = y_pred_test
-            # compute per-group MAE using only the true/pred columns (avoid future pandas groupby.apply warning)
-            grp = df_pred.groupby(available_groups)[["_y_true", "_y_pred"]].apply(
-                lambda sub: float(mean_absolute_error(sub["_y_true"], sub["_y_pred"]))
-            )
-            grp = grp.sort_values(ascending=False)
-            top = grp.head(10).to_dict()
-            metrics["group_mae_top10"] = {str(k): float(v) for k, v in top.items()}
-            metrics["group_mae_median"] = float(grp.median()) if len(grp) > 0 else None
-    except Exception:
-        pass
+    # Evaluate
+    metrics = evaluate_model(model, X_train, y_train, X_test, y_test, X_all, y_all)
 
     # Save (include encoders so predict can reuse them)
     model_file, metrics_file = save_artifacts(
         model, metrics, encoders=encoders, tag=args.tag, lags=lags, windows=windows,
-        training_features_path=str(features_path), target_transform=transform_info["type"]
+        training_features_path=str(features_path)
     )
 
     # Print results
