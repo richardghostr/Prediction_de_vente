@@ -30,6 +30,12 @@ from src.config import (
     GROUP_COLS, CATEGORICAL_FEATURES,
 )
 from src.utils.logging import get_logger
+<<<<<<< HEAD
+=======
+
+
+logger = get_logger(__name__)
+>>>>>>> 9fcbb8d36aedbb58bdba22e979eabd214f45666e
 
 
 logger = get_logger(__name__)
@@ -272,6 +278,7 @@ def evaluate(
                     src_clean = clean_files[0]
                     logger.info("[evaluate] Using %s to rebuild features", src_clean)
                     df_clean = pd.read_csv(src_clean, parse_dates=["date"]) if src_clean.exists() else None
+<<<<<<< HEAD
                     if df_clean is not None:
                         try:
                             # When rebuilding from the cleaned source, let the feature
@@ -298,6 +305,33 @@ def evaluate(
                         except Exception as e:
                             logger.error("[evaluate] Failed to rebuild features from %s: %s", src_clean, e)
 
+=======
+                if df_clean is not None:
+                    try:
+                        # When rebuilding from the cleaned source, let the feature
+                        # pipeline detect group columns / aliases from that file
+                        # rather than using the group columns inferred from the
+                        # training features file (they may use different names).
+                        result = build_feature_pipeline(
+                            df_clean, lags=lags, windows=windows,
+                            group_cols=None,
+                            categorical_cols=None,
+                            encoders=encoders,
+                        )
+                        if isinstance(result, tuple) and len(result) == 2:
+                            df, _ = result
+                        else:
+                            df = result
+                        # Persist regenerated features to FEATURES_PATH for reproducibility
+                        try:
+                            FEATURES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                            df.to_csv(FEATURES_PATH, index=False)
+                            logger.info("[evaluate] Regenerated features saved to %s", FEATURES_PATH)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.error("[evaluate] Failed to rebuild features from %s: %s", src_clean, e)
+>>>>>>> 9fcbb8d36aedbb58bdba22e979eabd214f45666e
             else:
                 logger.warning("[evaluate] No cleaned interim file found to regenerate features.")
         except Exception as e:

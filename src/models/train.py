@@ -122,6 +122,7 @@ def load_and_prepare(
     after = len(df)
     if before != after:
         logger.info("[train] Dropped %d NaN rows (from lags/rolling warm-up)", before - after)
+<<<<<<< HEAD
         try:
             drop_pct = 100.0 * (before - after) / before if before > 0 else 0.0
             logger.info("[train] Percent rows dropped after feature-engineering: %.2f%%", drop_pct)
@@ -154,6 +155,8 @@ def load_and_prepare(
                     pass
         except Exception:
             pass
+=======
+>>>>>>> 9fcbb8d36aedbb58bdba22e979eabd214f45666e
 
     return df, encoders
 
@@ -511,7 +514,11 @@ def main(argv=None) -> int:
     X_train, y_train, X_val, y_val, X_test, y_test, dates_test, test_df = split_time_series(
         df, horizon=horizon, val_horizon=(val_horizon if val_horizon > 0 else None), exclude_cols=FEATURE_EXCLUDE, group_cols=available_groups
     )
+<<<<<<< HEAD
     logger.info("[train] Train: %d samples, Val: %s, Test: %d samples", len(y_train), (len(y_val) if y_val is not None else '0'), len(y_test))
+=======
+    logger.info("[train] Train: %d samples, Test: %d samples", len(y_train), len(y_test))
+>>>>>>> 9fcbb8d36aedbb58bdba22e979eabd214f45666e
     logger.info("[train] Feature columns (%d): %s", X_train.shape[1], list(X_train.columns))
 
     # Full feature set for CV
