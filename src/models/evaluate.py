@@ -29,8 +29,12 @@ from src.config import (
     PREDICT_LAGS, PREDICT_WINDOWS, FEATURE_EXCLUDE,
     GROUP_COLS, CATEGORICAL_FEATURES,
 )
+from src.utils.logging import get_logger
 
-FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
+
+logger = get_logger(__name__)
+
+FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "uploaded_generated_training_10950_features.csv"
 ARTIFACTS_PATH = PROJECT_ROOT / "models" / "artifacts"
 METRICS_PATH = PROJECT_ROOT / "models" / "metrics"
 
@@ -65,7 +69,7 @@ def load_model(model_path: Optional[Path] = None):
     if model_path is None:
         raise FileNotFoundError(f"No model artifact found in {ARTIFACTS_PATH}")
     model = joblib.load(model_path)
-    print(f"[evaluate] Loaded model: {model_path}")
+    logger.info("[evaluate] Loaded model: %s", model_path)
     return model, model_path
 
 
@@ -195,14 +199,14 @@ def evaluate(
         if windows is None:
             windows = model_config.get("windows", PREDICT_WINDOWS)
         encoders = model_config.get("encoders")
-        print(f"[evaluate] Using model config: lags={lags}, windows={windows}")
+        logger.info("[evaluate] Using model config: lags=%s, windows=%s", lags, windows)
     else:
         if lags is None:
             lags = PREDICT_LAGS
         if windows is None:
             windows = PREDICT_WINDOWS
         encoders = None
-        print(f"[evaluate] Using shared config: lags={lags}, windows={windows}")
+        logger.info("[evaluate] Using shared config: lags=%s, windows=%s", lags, windows)
 
     # 2. Load raw features CSV (NOT aggregated)
     # If the model config saved the original training features path, prefer it
@@ -211,7 +215,7 @@ def evaluate(
         cand = Path(model_config.get("training_features_path"))
         if cand.exists():
             features_source = cand
-            print(f"[evaluate] Using model's training features source: {features_source}")
+            logger.info("[evaluate] Using model's training features source: %s", features_source)
 
     if not features_source.exists():
         raise FileNotFoundError(f"Features file not found at {features_source}")
@@ -243,7 +247,7 @@ def evaluate(
     sort_cols = available_groups + ["date"]
     df = df.sort_values(sort_cols).reset_index(drop=True)
 
-    print(f"[evaluate] Loaded {len(df)} rows, groups: {available_groups}")
+    logger.info("[evaluate] Loaded %d rows, groups: %s", len(df), available_groups)
 
     # Rebuild features (group-aware)
     # If the features file does not contain columns expected by the model
@@ -255,65 +259,78 @@ def evaluate(
 
     missing_expected = [c for c in expected_features if c not in df.columns]
     if missing_expected:
-        print(f"[evaluate] Detected missing expected features: {missing_expected}. Attempting to regenerate features from cleaned data...")
+        logger.warning(
+            "[evaluate] Detected missing expected features: %s. "
+            "Attempting to regenerate features from cleaned data...",
+            missing_expected,
+        )
         # Find a cleaned interim file to rebuild features
         try:
             interim_dir = PROJECT_ROOT / "data" / "interim"
             clean_files = sorted(interim_dir.glob("*_clean.csv"), reverse=True) if interim_dir.exists() else []
             if clean_files:
-                src_clean = clean_files[0]
-                print(f"[evaluate] Using {src_clean} to rebuild features")
-                df_clean = pd.read_csv(src_clean, parse_dates=["date"]) if src_clean.exists() else None
-                if df_clean is not None:
-                    try:
-                        # When rebuilding from the cleaned source, let the feature
-                        # pipeline detect group columns / aliases from that file
-                        # rather than using the group columns inferred from the
-                        # training features file (they may use different names).
-                        result = build_feature_pipeline(
-                            df_clean, lags=lags, windows=windows,
-                            group_cols=None,
-                            categorical_cols=None,
-                            encoders=encoders,
-                        )
-                        if isinstance(result, tuple) and len(result) == 2:
-                            df, _ = result
-                        else:
-                            df = result
-                        # Persist regenerated features to FEATURES_PATH for reproducibility
+                    src_clean = clean_files[0]
+                    logger.info("[evaluate] Using %s to rebuild features", src_clean)
+                    df_clean = pd.read_csv(src_clean, parse_dates=["date"]) if src_clean.exists() else None
+                    if df_clean is not None:
                         try:
-                            FEATURES_PATH.parent.mkdir(parents=True, exist_ok=True)
-                            df.to_csv(FEATURES_PATH, index=False)
-                            print(f"[evaluate] Regenerated features saved to {FEATURES_PATH}")
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        print(f"[evaluate] Failed to rebuild features from {src_clean}: {e}")
+                            # When rebuilding from the cleaned source, let the feature
+                            # pipeline detect group columns / aliases from that file
+                            # rather than using the group columns inferred from the
+                            # training features file (they may use different names).
+                            result = build_feature_pipeline(
+                                df_clean, lags=lags, windows=windows,
+                                group_cols=None,
+                                categorical_cols=None,
+                                encoders=encoders,
+                            )
+                            if isinstance(result, tuple) and len(result) == 2:
+                                df, _ = result
+                            else:
+                                df = result
+                            # Persist regenerated features to FEATURES_PATH for reproducibility
+                            try:
+                                FEATURES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                                df.to_csv(FEATURES_PATH, index=False)
+                                logger.info("[evaluate] Regenerated features saved to %s", FEATURES_PATH)
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            logger.error("[evaluate] Failed to rebuild features from %s: %s", src_clean, e)
+
             else:
-                print("[evaluate] No cleaned interim file found to regenerate features.")
+                logger.warning("[evaluate] No cleaned interim file found to regenerate features.")
         except Exception as e:
-            print(f"[evaluate] Error during feature regeneration attempt: {e}")
+            logger.error("[evaluate] Error during feature regeneration attempt: %s", e)
 
     else:
         # Normal path: rebuild features from the loaded features file (no regen needed)
         pass
 
     # Now run the feature pipeline on the (possibly regenerated) dataframe
-    df, _ = build_feature_pipeline(
+    result = build_feature_pipeline(
         df, lags=lags, windows=windows,
         group_cols=available_groups if available_groups else None,
         categorical_cols=cat_cols if cat_cols else None,
         encoders=encoders,
     )
+    if isinstance(result, tuple) and len(result) == 2:
+        df, _ = result
+    else:
+        df = result
+        if encoders is None:
+            encoders = getattr(df, "attrs", {}).get("encoders", None)
     df = df.dropna().reset_index(drop=True)
-    print(f"[evaluate] After feature engineering: {len(df)} rows, {len(df.columns)} columns")
+    logger.info("[evaluate] After feature engineering: %d rows, %d columns", len(df), len(df.columns))
 
     # 3. Split by date cutoff (same logic as train.py)
     unique_dates = sorted(df["date"].unique())
     effective_horizon = horizon
     if effective_horizon >= len(unique_dates):
         effective_horizon = max(1, len(unique_dates) // 5)
-        print(f"[evaluate] Adjusted horizon to {effective_horizon} (not enough unique dates)")
+        logger.warning(
+            "[evaluate] Adjusted horizon to %d (not enough unique dates)", effective_horizon
+        )
 
     cutoff_date = unique_dates[-effective_horizon]
     train_mask = df["date"] < cutoff_date
@@ -327,8 +344,12 @@ def evaluate(
     X_test = df.loc[test_mask, feature_cols].copy()
     y_test = df.loc[test_mask, "value"].copy()
 
-    print(f"[evaluate] Train: {len(y_train)} samples, Test: {len(y_test)} samples")
-    print(f"[evaluate] Date cutoff: {cutoff_date}")
+    logger.info(
+        "[evaluate] Train: %d samples, Test: %d samples, cutoff_date=%s",
+        len(y_train),
+        len(y_test),
+        cutoff_date,
+    )
 
     # 4. Align features to model expectations
     X_train = _align_features_to_model(X_train, model)
@@ -339,18 +360,35 @@ def evaluate(
         matched = expected & set(feature_cols)
         missing = expected - set(feature_cols)
         extra = set(feature_cols) - expected
-        print(f"[evaluate] Features: {len(matched)} matched, {len(missing)} filled with 0, {len(extra)} dropped")
+        logger.info(
+            "[evaluate] Features: %d matched, %d filled with 0, %d dropped",
+            len(matched),
+            len(missing),
+            len(extra),
+        )
         if missing:
-            print(f"[evaluate] WARNING: These model features were filled with 0: {sorted(missing)}")
+            logger.warning(
+                "[evaluate] These model features were filled with 0: %s",
+                sorted(missing),
+            )
 
     # Diagnostics
     diagnostics = _diagnose_data(y_train, y_test)
     for w in diagnostics.get("warnings", []):
-        print(f"[evaluate] DATA WARNING: {w}")
+        logger.warning("[evaluate] DATA WARNING: %s", w)
 
     # 5. Predict and compute metrics
     y_pred_train = model.predict(X_train)
     y_pred_test = model.predict(X_test)
+
+    # If model used a target transform during training, invert predictions
+    tform = model_config.get("target_transform") if model_config else None
+    if tform == "log1p":
+        try:
+            y_pred_train = np.expm1(y_pred_train)
+            y_pred_test = np.expm1(y_pred_test)
+        except Exception:
+            logger.warning("[evaluate] Failed to invert target transform on predictions")
 
     train_metrics = compute_metrics(y_train, y_pred_train)
     test_metrics = compute_metrics(y_test, y_pred_test)

@@ -1,3 +1,271 @@
+"""
+Ingestion de données brutes pour le pipeline de prévision de ventes.
+
+Objectifs :
+- Charger un ou plusieurs fichiers CSV bruts.
+- Détecter et mapper automatiquement les colonnes clés (id, date, value)
+  à l’aide de la configuration `configs/mapping_config.yml`.
+- Normaliser les types (dates, numériques) et appliquer des règles de
+  validation simples.
+- Écrire des fichiers `*_ingest.csv` compatibles avec `clean.py` / `features.py`.
+
+Ce module fournit :
+- une fonction de bas niveau `ingest_single_csv` utilisée par l’UI Streamlit ;
+- une CLI utilisable en ligne de commande :
+
+    python src/data/ingest.py --in data/raw --out data/raw
+    python src/data/ingest.py --in data/raw/sample.csv --out data/raw
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, List
+
+import pandas as pd
+
+from src.utils.mapping_optimized import (
+    find_best_mapping_optimize,
+    apply_mapping_and_transform,
+)
+
+
+@dataclass
+class IngestConfig:
+    targets: List[str]
+    aliases: Dict[str, List[str]]
+    data_types: Dict[str, str]
+    validation_rules: Dict[str, Any]
+
+
+def load_config(path: Path) -> IngestConfig:
+    """Charge le fichier YAML de configuration de mapping/validation."""
+    import yaml
+
+    with path.open("r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+
+    return IngestConfig(
+        targets=raw.get("targets", []),
+        aliases=raw.get("aliases", {}),
+        data_types=raw.get("data_types", {}),
+        validation_rules=raw.get("validation_rules", {}),
+    )
+
+
+def _validate_df(df: pd.DataFrame, cfg: IngestConfig) -> Tuple[bool, Dict[str, Any]]:
+    """Applique les règles de validation définies dans la config.
+
+    Retourne (is_valid, details).
+    """
+    details: Dict[str, Any] = {"missing": {}, "rules": {}}
+    rules = cfg.validation_rules or {}
+
+    # Validation sur les valeurs min/max de `value`
+    value_rules = rules.get("value", {})
+    if "value" in df.columns:
+        series = pd.to_numeric(df["value"], errors="coerce")
+        vmin = float(series.min()) if len(series) else None
+        vmax = float(series.max()) if len(series) else None
+        details["rules"]["value_range"] = {"min": vmin, "max": vmax}
+
+        min_rule = value_rules.get("min")
+        max_rule = value_rules.get("max")
+        if min_rule is not None and vmin is not None and vmin < min_rule:
+            details.setdefault("errors", []).append(
+                f"value.min={vmin} < rule.min={min_rule}"
+            )
+        if max_rule is not None and vmax is not None and vmax > max_rule:
+            details.setdefault("errors", []).append(
+                f"value.max={vmax} > rule.max={max_rule}"
+            )
+
+    # Validation des seuils de valeurs manquantes
+    missing_thresholds = rules.get("missing_thresholds", {})
+    for col, threshold in missing_thresholds.items():
+        if col in df.columns:
+            ratio = df[col].isna().mean()
+            details["missing"][col] = float(ratio)
+            if ratio > threshold:
+                details.setdefault("errors", []).append(
+                    f"missing[{col}]={ratio:.3f} > threshold={threshold:.3f}"
+                )
+
+    ok = "errors" not in details
+    return ok, details
+
+
+def ingest_single_csv(
+    src_path: Path,
+    out_dir: Path,
+    cfg: IngestConfig,
+    mapping_file: Optional[str] = None,
+) -> str:
+    """Ingestion d'un seul CSV.
+
+    Étapes :
+    1. Lecture du CSV brut.
+    2. Détection/mapping des colonnes vers (id, date, value, …) via config.
+    3. Normalisation des types (dates, numériques).
+    4. Validation basique.
+    5. Écriture d'un fichier `<stem>_ingest.csv` dans `out_dir`.
+
+    Retourne le chemin du fichier écrit.
+    """
+    src_path = Path(src_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df_raw = pd.read_csv(src_path)
+
+    # Si un mapping manuel JSON est fourni, charger et appliquer directement.
+    if mapping_file:
+        mpath = Path(mapping_file)
+        with mpath.open("r", encoding="utf-8") as f:
+            manual = json.load(f)
+        mapping = manual.get("mapping", {})
+    else:
+        mapping = find_best_mapping_optimize(
+            df_raw,
+            targets=cfg.targets,
+            aliases=cfg.aliases,
+            name_threshold=50.0,
+        )
+
+    df_mapped = apply_mapping_and_transform(df_raw, mapping, cfg.data_types)
+
+    # Renommer éventuellement pour coller au contrat de downstream:
+    # - `date` & `value` sont déjà normalisés par data_types.
+    # - `id` reste tel quel; on pourra le remapper côté features/train si besoin.
+
+    ok, details = _validate_df(df_mapped, cfg)
+
+    stem = src_path.stem
+    out_name = f"{stem}_ingest.csv" if not stem.endswith("_ingest") else f"{stem}.csv"
+    out_path = out_dir / out_name
+    df_mapped.to_csv(out_path, index=False)
+
+    # Écrire un fichier de métadonnées optionnel si l'appelant l'a demandé
+    # en positionnant l'attribut `write_meta` sur la fonction (voir UI).
+    if getattr(ingest_single_csv, "write_meta", False):
+        meta = {
+            "source": str(src_path),
+            "output": str(out_path),
+            "rows": int(len(df_mapped)),
+            "columns": list(df_mapped.columns),
+            "validation": details,
+        }
+        meta_path = out_path.with_suffix(out_path.suffix + ".metadata.json")
+        with meta_path.open("w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2, default=str)
+
+    return str(out_path)
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Ingestion de CSV bruts vers fichiers *_ingest.csv"
+    )
+    parser.add_argument(
+        "--in",
+        dest="input",
+        required=True,
+        help="Fichier ou dossier d'entrée (ex: data/raw ou data/raw/mon_fichier.csv)",
+    )
+    parser.add_argument(
+        "--out",
+        dest="output",
+        default="data/raw",
+        help="Dossier de sortie (par défaut: data/raw)",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config",
+        default="configs/mapping_config.yml",
+        help="Chemin vers le fichier de configuration YAML",
+    )
+    parser.add_argument(
+        "--mapping-file",
+        dest="mapping_file",
+        default=None,
+        help="Fichier JSON de mapping manuel des colonnes (optionnel)",
+    )
+    parser.add_argument(
+        "--write-meta",
+        dest="write_meta",
+        action="store_true",
+        help="Écrire un fichier de métadonnées JSON à côté du CSV ingesté",
+    )
+    parser.add_argument(
+        "--pattern",
+        dest="pattern",
+        default="*.csv",
+        help="Motif glob pour les fichiers si --in est un dossier (défaut: *.csv)",
+    )
+    parser.add_argument(
+        "--no-verbose",
+        dest="verbose",
+        action="store_false",
+        help="Désactiver les messages de progression",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    inp = Path(args.input)
+    outd = Path(args.output)
+    cfg_path = Path(args.config)
+    mapping_file = args.mapping_file
+    verbose = args.verbose
+
+    try:
+        cfg = load_config(cfg_path)
+    except Exception as e:
+        print(f"[ingest] ERREUR: impossible de charger la config {cfg_path}: {e}")
+        return 1
+
+    try:
+        if inp.is_file():
+            if verbose:
+                print(f"[ingest] Fichier unique : {inp}")
+            if args.write_meta:
+                setattr(ingest_single_csv, "write_meta", True)
+            out = ingest_single_csv(inp, outd, cfg, mapping_file=mapping_file)
+            if verbose:
+                print(f"[ingest] Écrit {out}")
+        elif inp.is_dir():
+            files = list(inp.glob(args.pattern))
+            if not files:
+                print(f"[ingest] Aucun fichier correspondant à {args.pattern} dans {inp}")
+                return 2
+            if args.write_meta:
+                setattr(ingest_single_csv, "write_meta", True)
+            for f in files:
+                try:
+                    if verbose:
+                        print(f"[ingest] Traitement de {f}")
+                    out = ingest_single_csv(f, outd, cfg, mapping_file=mapping_file)
+                    if verbose:
+                        print(f"[ingest]   -> {out}")
+                except Exception as e:
+                    print(f"[ingest] ERREUR sur {f} : {e}")
+        else:
+            print(f"[ingest] Entrée invalide : {inp}")
+            return 2
+    except Exception as e:
+        print(f"[ingest] ERREUR : {e}")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
 date,value,store,product,price,id
 2019-06-19,15.2,store_07,prod_001,11.2,store_07_prod_001
 2019-02-06,19.78,store_24,prod_003,13.43,store_24_prod_003

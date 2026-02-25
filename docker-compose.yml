@@ -14,8 +14,8 @@ services:
       - ./:/app:cached
     command: >
       sh -c "
-        (find /app/models/artifacts -maxdepth 1 -name 'model_*_improved.pkl' 2>/dev/null | grep -q .) ||
-        (python -m src.models.improved_train --tag improved || true);
+        (find /app/models/artifacts -maxdepth 1 -name 'model_*_baseline.pkl' 2>/dev/null | grep -q .) ||
+        (python -m src.models.train --tag improved || true);
         exec uvicorn src.serve.api:app --host 0.0.0.0 --port 8000
       "
 

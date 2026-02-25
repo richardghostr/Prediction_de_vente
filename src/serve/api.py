@@ -12,7 +12,6 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from datetime import timedelta, datetime, timezone
-import logging
 import json
 from pathlib import Path
 import time
@@ -26,8 +25,9 @@ from src.serve.schemas import (
     ModelInfoResponse,
 )
 from src import config
+from src.utils.logging import get_logger
 
-logger = logging.getLogger("serve.api")
+logger = get_logger("serve.api")
 
 # ---------------------------------------------------------------------------
 # App setup
