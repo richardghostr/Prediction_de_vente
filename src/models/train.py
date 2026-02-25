@@ -20,8 +20,8 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
-from xgboost import XGBRegressor
 import joblib
+from xgboost import XGBRegressor
 
 # Ensure project root is on sys.path for absolute imports
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -33,6 +33,10 @@ from src.config import (
     FEATURE_EXCLUDE, PREDICT_LAGS, PREDICT_WINDOWS,
     GROUP_COLS, CATEGORICAL_FEATURES, BINARY_FEATURES,
 )
+from src.utils.logging import get_logger
+
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +68,7 @@ def load_and_prepare(
 
     Returns (dataframe, encoders_dict).
     """
+    logger.info(f"[train] Loading raw features from %s", path)
     df = pd.read_csv(path, parse_dates=["date"])
 
     # Remap columns from ingest format if needed:
@@ -71,7 +76,7 @@ def load_and_prepare(
     # We need store_id back as a group column
     if "store_id" not in df.columns and "id" in df.columns:
         df = df.rename(columns={"id": "store_id"})
-        print("[train] Remapped 'id' -> 'store_id' (from ingest format)")
+        logger.info("[train] Remapped 'id' -> 'store_id' (from ingest format)")
 
     # Handle on_promo: convert True/False strings to int
     if "on_promo" in df.columns:
@@ -82,11 +87,11 @@ def load_and_prepare(
     # Detect available group columns
     available_groups = [c for c in GROUP_COLS if c in df.columns]
     if available_groups:
-        print(f"[train] Group columns detected: {available_groups}")
+        logger.info("[train] Group columns detected: %s", available_groups)
         n_groups = df.groupby(available_groups).ngroups if len(available_groups) > 0 else 1
-        print(f"[train] Number of distinct groups: {n_groups}")
+        logger.info("[train] Number of distinct groups: %d", n_groups)
     else:
-        print("[train] WARNING: No group columns found -- treating as single series")
+        logger.warning("[train] No group columns found -- treating as single series")
 
     # Sort by group + date for correct temporal ordering
     sort_cols = available_groups + ["date"]
@@ -109,7 +114,7 @@ def load_and_prepare(
     df = df.dropna().reset_index(drop=True)
     after = len(df)
     if before != after:
-        print(f"[train] Dropped {before - after} NaN rows (from lags/rolling warm-up)")
+        logger.info("[train] Dropped %d NaN rows (from lags/rolling warm-up)", before - after)
 
     return df, encoders
 
@@ -136,7 +141,7 @@ def split_time_series(
     unique_dates = sorted(df[date_col].unique())
     if horizon >= len(unique_dates):
         horizon = max(1, len(unique_dates) // 5)
-        print(f"[train] Adjusted horizon to {horizon} (not enough unique dates)")
+        logger.warning("[train] Adjusted horizon to %d (not enough unique dates)", horizon)
 
     cutoff_date = unique_dates[-horizon]
     train_mask = df[date_col] < cutoff_date
@@ -341,28 +346,33 @@ def main(argv=None) -> int:
     horizon = args.horizon
 
     features_path = FEATURES_PATH
-    print(f"[train] Loading features from {features_path}")
-    print(f"[train] Config: lags={lags}, windows={windows}, horizon={horizon}")
+    logger.info("[train] Loading features from %s", features_path)
+    logger.info("[train] Config: lags=%s, windows=%s, horizon=%d", lags, windows, horizon)
 
     # Support a fallback features file when the primary training CSV is absent
     if not features_path.exists():
         fallback = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
         if fallback.exists():
-            print(f"[train] Primary features file not found. Falling back to {fallback}")
+            logger.warning("[train] Primary features file not found. Falling back to %s", fallback)
             features_path = fallback
         else:
-            print(f"[train] ERROR: Features file not found at {features_path}")
-            print("[train] Run the feature pipeline first: python -m src.data.features")
+            logger.error("[train] Features file not found at %s", features_path)
+            logger.error("[train] Run the feature pipeline first: python -m src.data.features")
             return 1
 
     # Load and prepare (group-aware, NO aggregation)
     df, encoders = load_and_prepare(features_path, lags=lags, windows=windows)
-    print(f"[train] Dataset shape after feature engineering: {df.shape}")
-    print(f"[train] Target stats: mean={df['value'].mean():.2f}, std={df['value'].std():.2f}, "
-          f"min={df['value'].min():.2f}, max={df['value'].max():.2f}")
+    logger.info("[train] Dataset shape after feature engineering: %s", df.shape)
+    logger.info(
+        "[train] Target stats: mean=%.2f, std=%.2f, min=%.2f, max=%.2f",
+        df["value"].mean(),
+        df["value"].std(),
+        df["value"].min(),
+        df["value"].max(),
+    )
 
     if len(df) <= horizon:
-        print(f"[train] ERROR: Not enough data ({len(df)} rows) for horizon={horizon}")
+        logger.error("[train] Not enough data (%d rows) for horizon=%d", len(df), horizon)
         return 1
 
     # Detect group cols for splitting
@@ -372,8 +382,8 @@ def main(argv=None) -> int:
     X_train, y_train, X_test, y_test, dates_test = split_time_series(
         df, horizon=horizon, exclude_cols=FEATURE_EXCLUDE, group_cols=available_groups
     )
-    print(f"[train] Train: {len(y_train)} samples, Test: {len(y_test)} samples")
-    print(f"[train] Feature columns ({X_train.shape[1]}): {list(X_train.columns)}")
+    logger.info("[train] Train: %d samples, Test: %d samples", len(y_train), len(y_test))
+    logger.info("[train] Feature columns (%d): %s", X_train.shape[1], list(X_train.columns))
 
     # Full feature set for CV
     exclude_cols = set(FEATURE_EXCLUDE) | {"value", "date"}
