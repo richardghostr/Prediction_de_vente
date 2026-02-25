@@ -189,9 +189,15 @@ def add_lag_interactions(df: pd.DataFrame) -> pd.DataFrame:
     if "lag_1" in df.columns and "lag_14" in df.columns:
         df["lag_diff_1_14"] = df["lag_1"] - df["lag_14"]
 
+    # Additional lag differences (longer-term momentum)
+    if "lag_1" in df.columns and "lag_28" in df.columns:
+        df["lag_diff_1_28"] = df["lag_1"] - df["lag_28"]
+
     # Lag ratios (relative change)
     if "lag_1" in df.columns and "lag_7" in df.columns:
         df["lag_ratio_1_7"] = df["lag_1"] / df["lag_7"].replace(0, np.nan)
+    if "lag_7" in df.columns and "lag_28" in df.columns:
+        df["lag_ratio_7_28"] = df["lag_7"] / df["lag_28"].replace(0, np.nan)
 
     # Rolling coefficient of variation
     for w in [7, 14, 28]:
@@ -207,6 +213,147 @@ def add_lag_interactions(df: pd.DataFrame) -> pd.DataFrame:
         max_col = f"roll_max_{w}"
         if min_col in df.columns and max_col in df.columns:
             df[f"roll_range_{w}"] = df[max_col] - df[min_col]
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Store x Time crossed features
+# ---------------------------------------------------------------------------
+
+def add_store_time_interactions(
+    df: pd.DataFrame,
+    group_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Create interaction features between store identity and temporal patterns.
+    These capture store-specific weekly/monthly seasonality."""
+    df = df.copy()
+    store_col = None
+    if group_cols:
+        for c in group_cols:
+            if "store" in c.lower() and c in df.columns:
+                store_col = c
+                break
+    if store_col is None:
+        return df
+
+    # Store x dayofweek: each store may have different weekly patterns
+    if "dayofweek" in df.columns:
+        df["store_dow"] = df[store_col].astype(str) + "_" + df["dayofweek"].astype(str)
+        df["store_dow"] = pd.Categorical(df["store_dow"]).codes
+
+    # Store x month: each store may have different monthly patterns
+    if "month" in df.columns:
+        df["store_month"] = df[store_col].astype(str) + "_" + df["month"].astype(str)
+        df["store_month"] = pd.Categorical(df["store_month"]).codes
+
+    # Store x is_weekend
+    if "is_weekend" in df.columns:
+        df["store_weekend"] = df[store_col].astype(str) + "_" + df["is_weekend"].astype(str)
+        df["store_weekend"] = pd.Categorical(df["store_weekend"]).codes
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Trend slope features (linear regression slope over rolling window)
+# ---------------------------------------------------------------------------
+
+def add_trend_features(
+    df: pd.DataFrame,
+    value_col: str = "value",
+    windows: Optional[List[int]] = None,
+    group_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Compute linear trend slope over rolling windows.
+    A positive slope means sales are increasing, negative means decreasing.
+    Uses shift(1) to avoid leakage."""
+    df = df.copy()
+    if windows is None:
+        windows = [7, 14]
+
+    def _rolling_slope(series, w):
+        """Slope of linear fit over last w values."""
+        x = np.arange(w, dtype=float)
+        x_mean = x.mean()
+        x_var = ((x - x_mean) ** 2).sum()
+        if x_var == 0:
+            return series * 0.0
+
+        def slope_fn(vals):
+            if len(vals) < w:
+                return np.nan
+            y = vals.values
+            y_mean = y.mean()
+            return ((x - x_mean) * (y - y_mean)).sum() / x_var
+
+        return series.rolling(window=w, min_periods=w).apply(slope_fn, raw=False)
+
+    for w in windows:
+        col_name = f"trend_slope_{w}"
+        if group_cols and all(c in df.columns for c in group_cols):
+            shifted = df.groupby(group_cols)[value_col].shift(1)
+            gkey = df[group_cols].apply(lambda row: tuple(row), axis=1)
+            df[col_name] = shifted.groupby(gkey).transform(
+                lambda s: _rolling_slope(s, w)
+            )
+        else:
+            shifted = df[value_col].shift(1)
+            df[col_name] = _rolling_slope(shifted, w)
+
+        df[col_name] = df[col_name].fillna(0)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Rolling quantile features
+# ---------------------------------------------------------------------------
+
+def add_rolling_quantiles(
+    df: pd.DataFrame,
+    value_col: str = "value",
+    windows: Optional[List[int]] = None,
+    group_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Add rolling Q25 and Q75 to capture distribution shape, not just mean."""
+    df = df.copy()
+    if windows is None:
+        windows = [14, 28]
+
+    for w in windows:
+        mp = max(w // 2, 3)
+        if group_cols and all(c in df.columns for c in group_cols):
+            shifted = df.groupby(group_cols)[value_col].shift(1)
+            gkey = df[group_cols].apply(lambda row: tuple(row), axis=1)
+            df[f"roll_q25_{w}"] = shifted.groupby(gkey).transform(
+                lambda x: x.rolling(window=w, min_periods=mp).quantile(0.25)
+            )
+            df[f"roll_q75_{w}"] = shifted.groupby(gkey).transform(
+                lambda x: x.rolling(window=w, min_periods=mp).quantile(0.75)
+            )
+        else:
+            shifted = df[value_col].shift(1)
+            df[f"roll_q25_{w}"] = shifted.rolling(window=w, min_periods=mp).quantile(0.25)
+            df[f"roll_q75_{w}"] = shifted.rolling(window=w, min_periods=mp).quantile(0.75)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Price-based features
+# ---------------------------------------------------------------------------
+
+def add_price_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add price ratio vs rolling mean to detect abnormal pricing."""
+    df = df.copy()
+    if "price" in df.columns and "roll_mean_28" in df.columns:
+        df["price_vs_roll_mean_28"] = df["price"] / df["roll_mean_28"].replace(0, np.nan)
+        df["price_vs_roll_mean_28"] = df["price_vs_roll_mean_28"].fillna(1.0).clip(0.1, 10.0)
+
+    if "price" in df.columns and "roll_mean_7" in df.columns:
+        df["price_vs_roll_mean_7"] = df["price"] / df["roll_mean_7"].replace(0, np.nan)
+        df["price_vs_roll_mean_7"] = df["price_vs_roll_mean_7"].fillna(1.0).clip(0.1, 10.0)
 
     return df
 
@@ -363,7 +510,19 @@ def build_feature_pipeline(
     # 5. Lag interaction features
     df = add_lag_interactions(df)
 
-    # 6. Target encoding for categorical columns (Bayesian smoothed)
+    # 6. Store x Time crossed features (store-specific patterns)
+    df = add_store_time_interactions(df, group_cols=group_cols)
+
+    # 7. Trend slope features (direction of recent sales)
+    df = add_trend_features(df, value_col=value_col, windows=[7, 14], group_cols=group_cols)
+
+    # 8. Rolling quantile features (distribution shape)
+    df = add_rolling_quantiles(df, value_col=value_col, windows=[14, 28], group_cols=group_cols)
+
+    # 9. Price-based features (detect abnormal pricing)
+    df = add_price_features(df)
+
+    # 10. Target encoding for categorical columns (Bayesian smoothed)
     target_enc_cols = [c for c in (group_cols or []) if c in df.columns and df[c].dtype == "object"]
     if target_enc_cols:
         df, encoders = add_target_encoding(
@@ -371,7 +530,7 @@ def build_feature_pipeline(
             encoders=encoders, is_train=is_train,
         )
 
-    # 7. Label-encode categorical columns (for tree models)
+    # 11. Label-encode categorical columns (for tree models)
     if categorical_cols is None:
         categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
     df, encoders = encode_categorical(df, cols=categorical_cols, encoders=encoders)

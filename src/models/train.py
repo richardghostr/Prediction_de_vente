@@ -332,15 +332,16 @@ def tune_xgb(
 
 def _default_lgbm_params() -> dict:
     return {
-        "n_estimators": 1000,
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "num_leaves": 63,
-        "min_child_samples": 20,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
+        "n_estimators": 1500,
+        "max_depth": 5,
+        "learning_rate": 0.03,
+        "num_leaves": 31,
+        "min_child_samples": 50,
+        "subsample": 0.7,
+        "colsample_bytree": 0.7,
+        "reg_alpha": 1.0,
+        "reg_lambda": 5.0,
+        "min_split_gain": 0.01,
         "random_state": 42,
         "verbosity": -1,
         "n_jobs": -1,
@@ -349,16 +350,17 @@ def _default_lgbm_params() -> dict:
 
 def _default_xgb_params() -> dict:
     return {
-        "n_estimators": 1000,
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "min_child_weight": 5,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
+        "n_estimators": 1500,
+        "max_depth": 5,
+        "learning_rate": 0.03,
+        "min_child_weight": 10,
+        "subsample": 0.7,
+        "colsample_bytree": 0.7,
+        "reg_alpha": 1.0,
+        "reg_lambda": 5.0,
+        "gamma": 0.1,
         "random_state": 42,
-        "early_stopping_rounds": 50,
+        "early_stopping_rounds": 100,
         "verbosity": 0,
     }
 
@@ -378,7 +380,7 @@ def train_lgbm(X_train, y_train, X_val, y_val, params: dict):
             X_train, y_train,
             eval_set=[(X_val, y_val)],
             callbacks=[
-                _lgb_early_stopping(50),
+                _lgb_early_stopping(100),
                 _lgb_log_evaluation(-1),
             ],
         )
@@ -440,68 +442,97 @@ def evaluate_model(
     X_all: pd.DataFrame,
     y_all: pd.Series,
     n_cv_splits: int = 5,
+    log_target: bool = False,
+    y_test_original: Optional[pd.Series] = None,
+    lgbm_params: Optional[dict] = None,
 ) -> dict:
-    """Evaluate with train/test/CV metrics."""
-    # Train metrics
-    y_pred_train = model.predict(X_train)
-    mae_train = mean_absolute_error(y_train, y_pred_train)
-    rmse_train = sqrt(mean_squared_error(y_train, y_pred_train))
-    r2_train = r2_score(y_train, y_pred_train)
-    bias_train = float(np.mean(y_pred_train - y_train))
+    """Evaluate with train/test/CV metrics.
 
-    # Test metrics
+    If log_target=True, predictions are in log-space and will be
+    transformed back to original scale for final metrics using y_test_original.
+    CV uses the same model params as the main model for coherent evaluation.
+    """
+    # Train metrics (in transformed space for consistency)
+    y_pred_train = model.predict(X_train)
+    if log_target:
+        y_pred_train_orig = np.expm1(y_pred_train).clip(min=0)
+        y_train_orig = np.expm1(y_train)
+    else:
+        y_pred_train_orig = y_pred_train
+        y_train_orig = y_train
+    mae_train = mean_absolute_error(y_train_orig, y_pred_train_orig)
+    rmse_train = sqrt(mean_squared_error(y_train_orig, y_pred_train_orig))
+    r2_train = r2_score(y_train_orig, y_pred_train_orig)
+    bias_train = float(np.mean(y_pred_train_orig - y_train_orig))
+
+    # Test metrics (always in original scale)
     y_pred_test = model.predict(X_test)
-    mae_test = mean_absolute_error(y_test, y_pred_test)
-    rmse_test = sqrt(mean_squared_error(y_test, y_pred_test))
-    r2_test = r2_score(y_test, y_pred_test)
-    bias_test = float(np.mean(y_pred_test - y_test))
+    if log_target:
+        y_pred_test_orig = np.expm1(y_pred_test).clip(min=0)
+        y_test_eval = y_test_original if y_test_original is not None else np.expm1(y_test)
+    else:
+        y_pred_test_orig = y_pred_test
+        y_test_eval = y_test
+    mae_test = mean_absolute_error(y_test_eval, y_pred_test_orig)
+    rmse_test = sqrt(mean_squared_error(y_test_eval, y_pred_test_orig))
+    r2_test = r2_score(y_test_eval, y_pred_test_orig)
+    bias_test = float(np.mean(y_pred_test_orig - y_test_eval.values))
 
     # Safe MAPE (exclude near-zero actuals)
-    mask = np.abs(y_test.values) > 1.0
+    y_actual = y_test_eval.values
+    y_predicted = y_pred_test_orig
+    mask = np.abs(y_actual) > 1.0
     if mask.sum() > 0:
-        mape_test = float(np.mean(np.abs((y_test.values[mask] - y_pred_test[mask]) / y_test.values[mask])) * 100)
+        mape_test = float(np.mean(np.abs((y_actual[mask] - y_predicted[mask]) / y_actual[mask])) * 100)
     else:
         mape_test = None
 
     # sMAPE
-    denom = (np.abs(y_test.values) + np.abs(y_pred_test)) / 2
+    denom = (np.abs(y_actual) + np.abs(y_predicted)) / 2
     denom_safe = np.where(denom > 0, denom, 1.0)
-    smape_test = float(np.mean(np.abs(y_test.values - y_pred_test) / denom_safe) * 100)
+    smape_test = float(np.mean(np.abs(y_actual - y_predicted) / denom_safe) * 100)
 
-    # Cross-validation on full dataset
+    # Cross-validation on full dataset (use SAME params as main model)
     tscv = TimeSeriesSplit(n_splits=min(n_cv_splits, max(2, len(X_all) // 100)))
     cv_scores = {"mae": [], "rmse": [], "r2": []}
+
+    # Use the same params as the main model for coherent CV evaluation
+    cv_lgbm_params = lgbm_params if lgbm_params else _default_lgbm_params()
 
     for train_idx, val_idx in tscv.split(X_all):
         X_tr, X_val = X_all.iloc[train_idx], X_all.iloc[val_idx]
         y_tr, y_val = y_all.iloc[train_idx], y_all.iloc[val_idx]
 
-        # Use LightGBM for CV if available, else XGBoost
         try:
             from lightgbm import LGBMRegressor
-            model_cv = LGBMRegressor(
-                n_estimators=500, max_depth=6, learning_rate=0.05,
-                random_state=42, verbosity=-1, n_jobs=-1,
-            )
+            model_cv = LGBMRegressor(**cv_lgbm_params)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 model_cv.fit(
                     X_tr, y_tr,
                     eval_set=[(X_val, y_val)],
-                    callbacks=[_lgb_early_stopping(30), _lgb_log_evaluation(-1)],
+                    callbacks=[_lgb_early_stopping(50), _lgb_log_evaluation(-1)],
                 )
         except ImportError:
             from xgboost import XGBRegressor
-            model_cv = XGBRegressor(
-                n_estimators=500, max_depth=6, learning_rate=0.05,
-                random_state=42, early_stopping_rounds=30, verbosity=0,
-            )
+            cv_xgb_params = {k: v for k, v in cv_lgbm_params.items()
+                           if k not in ("num_leaves", "min_child_samples", "min_split_gain", "n_jobs")}
+            model_cv = XGBRegressor(**cv_xgb_params)
             model_cv.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
 
         y_val_pred = model_cv.predict(X_val)
-        cv_scores["mae"].append(float(mean_absolute_error(y_val, y_val_pred)))
-        cv_scores["rmse"].append(float(sqrt(mean_squared_error(y_val, y_val_pred))))
-        cv_scores["r2"].append(float(r2_score(y_val, y_val_pred)))
+
+        # Evaluate CV in original scale if log_target
+        if log_target:
+            y_val_pred_orig = np.expm1(y_val_pred).clip(min=0)
+            y_val_orig = np.expm1(y_val)
+        else:
+            y_val_pred_orig = y_val_pred
+            y_val_orig = y_val
+
+        cv_scores["mae"].append(float(mean_absolute_error(y_val_orig, y_val_pred_orig)))
+        cv_scores["rmse"].append(float(sqrt(mean_squared_error(y_val_orig, y_val_pred_orig))))
+        cv_scores["r2"].append(float(r2_score(y_val_orig, y_val_pred_orig)))
 
     overfit_ratio = rmse_test / rmse_train if rmse_train > 0 else float("inf")
 
@@ -596,6 +627,7 @@ def save_artifacts(
         config["bias_correction"] = -metrics["Bias_train"]
     if training_features_path is not None:
         config["training_features_path"] = str(training_features_path)
+    # log_target flag will be set by caller if needed
 
     config_file = model_file.parent / (model_file.stem + "_config.json")
     with open(config_file, "w") as f:
@@ -623,6 +655,10 @@ def main(argv=None) -> int:
     parser.add_argument("--n-trials", type=int, default=50, help="Number of Optuna trials (default: 50)")
     parser.add_argument("--tag", default="baseline")
     parser.add_argument("--ensemble", action="store_true", help="Train LightGBM + XGBoost ensemble")
+    parser.add_argument("--log-target", action="store_true", default=True,
+                        help="Apply log1p transform to target (default: True)")
+    parser.add_argument("--no-log-target", dest="log_target", action="store_false",
+                        help="Disable log1p transform on target")
     args = parser.parse_args(argv)
 
     lags = _parse_int_list(args.lags) if args.lags else PREDICT_LAGS
@@ -669,6 +705,16 @@ def main(argv=None) -> int:
     if X_train.shape[1] > 20:
         logger.info("[train] ... and %d more features", X_train.shape[1] - 20)
 
+    # Log-target transformation: stabilizes variance, reduces impact of extreme values
+    log_target = args.log_target
+    y_test_original = y_test.copy()  # Keep original scale for final evaluation
+    if log_target:
+        logger.info("[train] Applying log1p transform to target variable")
+        y_train = np.log1p(y_train.clip(lower=0))
+        y_test_log = np.log1p(y_test.clip(lower=0))
+    else:
+        y_test_log = y_test.copy()
+
     # Create a validation set from end of training data for early stopping
     val_size = max(int(len(X_train) * 0.15), horizon)
     X_tr = X_train.iloc[:-val_size]
@@ -681,7 +727,10 @@ def main(argv=None) -> int:
     exclude_cols = set(FEATURE_EXCLUDE) | {"value", "date"}
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     X_all = df[feature_cols].copy()
-    y_all = df["value"].copy()
+    if log_target:
+        y_all = np.log1p(df["value"].clip(lower=0)).copy()
+    else:
+        y_all = df["value"].copy()
 
     # Try LightGBM first, fallback to XGBoost
     use_lgbm = True
@@ -711,10 +760,15 @@ def main(argv=None) -> int:
         models.append(lgbm_model)
         model_names.append("LightGBM")
 
-        # Show LightGBM test score
+        # Show LightGBM test score (in original scale)
         lgbm_pred = lgbm_model.predict(X_test)
-        lgbm_r2 = r2_score(y_test, lgbm_pred)
-        lgbm_mae = mean_absolute_error(y_test, lgbm_pred)
+        if log_target:
+            lgbm_pred_orig = np.expm1(lgbm_pred).clip(min=0)
+            lgbm_r2 = r2_score(y_test_original, lgbm_pred_orig)
+            lgbm_mae = mean_absolute_error(y_test_original, lgbm_pred_orig)
+        else:
+            lgbm_r2 = r2_score(y_test_log, lgbm_pred)
+            lgbm_mae = mean_absolute_error(y_test_log, lgbm_pred)
         logger.info("[train] LightGBM test -> MAE=%.4f, R2=%.4f", lgbm_mae, lgbm_r2)
 
     if args.ensemble or not use_lgbm:
@@ -724,8 +778,13 @@ def main(argv=None) -> int:
         model_names.append("XGBoost")
 
         xgb_pred = xgb_model.predict(X_test)
-        xgb_r2 = r2_score(y_test, xgb_pred)
-        xgb_mae = mean_absolute_error(y_test, xgb_pred)
+        if log_target:
+            xgb_pred_orig = np.expm1(xgb_pred).clip(min=0)
+            xgb_r2 = r2_score(y_test_original, xgb_pred_orig)
+            xgb_mae = mean_absolute_error(y_test_original, xgb_pred_orig)
+        else:
+            xgb_r2 = r2_score(y_test_log, xgb_pred)
+            xgb_mae = mean_absolute_error(y_test_log, xgb_pred)
         logger.info("[train] XGBoost test -> MAE=%.4f, R2=%.4f", xgb_mae, xgb_r2)
 
     # Select or ensemble
@@ -748,8 +807,15 @@ def main(argv=None) -> int:
         model = models[0]
         tag = args.tag
 
-    # Evaluate
-    metrics = evaluate_model(model, X_train, y_train, X_test, y_test, X_all, y_all)
+    # Evaluate (use log-transformed y for model eval, but original scale for final metrics)
+    metrics = evaluate_model(
+        model, X_train, y_train,
+        X_test, y_test_log if log_target else y_test,
+        X_all, y_all,
+        log_target=log_target,
+        y_test_original=y_test_original,
+        lgbm_params=lgbm_params if use_lgbm else None,
+    )
 
     # Feature importance
     fi = get_feature_importance(model, list(X_train.columns))
@@ -758,11 +824,20 @@ def main(argv=None) -> int:
         for _, row in fi.head(10).iterrows():
             logger.info("[train]   %s: %.4f", row["feature"], row["importance"])
 
-    # Save
+    # Save (include log_target flag in config for predict/evaluate)
+    metrics["log_target"] = log_target
     model_file, metrics_file = save_artifacts(
         model, metrics, encoders=encoders, tag=tag, lags=lags, windows=windows,
         training_features_path=str(features_path), feature_importance=fi,
     )
+    # Also save log_target in the model config
+    config_file = model_file.parent / (model_file.stem + "_config.json")
+    if config_file.exists():
+        with open(config_file, "r") as f:
+            cfg = json.load(f)
+        cfg["log_target"] = log_target
+        with open(config_file, "w") as f:
+            json.dump(cfg, f, indent=2)
 
     # Print results
     print(f"\n{'='*60}")

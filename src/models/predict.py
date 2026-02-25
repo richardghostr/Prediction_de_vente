@@ -182,6 +182,7 @@ def predict_series(
 
     encoders = config.get("encoders")
     bias_correction = float(config.get("bias_correction", 0.0))
+    log_target = config.get("log_target", False)
 
     try:
         from src.data.features import build_feature_pipeline
@@ -258,6 +259,9 @@ def predict_series(
                 X_last = X_clean.iloc[[-1]]
                 X_last = _align_features_to_model(X_last, model)
                 raw = float(model.predict(X_last)[0])
+                # If model was trained with log1p target, inverse-transform
+                if log_target:
+                    raw = float(np.expm1(raw))
                 raw_corrected = raw + bias_correction
                 yhat = raw_corrected if math.isfinite(raw_corrected) else float(last_val)
 

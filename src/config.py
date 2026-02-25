@@ -43,7 +43,7 @@ BINARY_FEATURES = ["on_promo"]
 
 # Columns to exclude from model features (identifiers / targets that would cause leakage)
 # NOTE: store_id and product_id are ENCODED separately, their raw text is excluded here.
-FEATURE_EXCLUDE = {"value", "date", "id", "category", "revenue", "unit_price", "email", "quantity"}
+FEATURE_EXCLUDE = {"value", "date", "id", "category", "revenue", "unit_price", "email", "quantity", "store"}
 
 # Date formatting
 DATE_FORMAT = "%Y-%m-%d"

@@ -301,8 +301,21 @@ def evaluate(
         logger.warning("[evaluate] DATA WARNING: %s", w)
 
     # 5. Predict and compute metrics
-    y_pred_train = model.predict(X_train)
-    y_pred_test = model.predict(X_test)
+    # Detect log_target from model config
+    log_target = model_config.get("log_target", False) if model_config else False
+    if log_target:
+        logger.info("[evaluate] log_target=True detected -- applying log1p/expm1 transforms")
+
+    y_pred_train_raw = model.predict(X_train)
+    y_pred_test_raw = model.predict(X_test)
+
+    if log_target:
+        # Model was trained in log-space: transform predictions back to original scale
+        y_pred_train = np.expm1(y_pred_train_raw).clip(min=0)
+        y_pred_test = np.expm1(y_pred_test_raw).clip(min=0)
+    else:
+        y_pred_train = y_pred_train_raw
+        y_pred_test = y_pred_test_raw
 
     train_metrics = compute_metrics(y_train, y_pred_train)
     test_metrics = compute_metrics(y_test, y_pred_test)
