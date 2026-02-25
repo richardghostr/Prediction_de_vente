@@ -3,14 +3,17 @@
 Group-aware version: evaluates models trained on multi-series data
 (store x product groups) without destructive date aggregation.
 
+Supports LightGBM, XGBoost, and ensemble models.
+
 Usage:
     python -m src.models.evaluate
-    python -m src.models.evaluate --horizon 30 --lags 1,7,14 --windows 7,14
+    python -m src.models.evaluate --horizon 60 --lags 1,2,3,7,14,21,28 --windows 7,14,28
 """
 
 import argparse
 import json
 import sys
+import warnings
 from math import sqrt
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -31,10 +34,10 @@ from src.config import (
 )
 from src.utils.logging import get_logger
 
-
 logger = get_logger(__name__)
 
 FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "uploaded_generated_training_10950_features.csv"
+INTERIM_PATH = PROJECT_ROOT / "data" / "interim" / "generated_training_10950_clean.csv"
 ARTIFACTS_PATH = PROJECT_ROOT / "models" / "artifacts"
 METRICS_PATH = PROJECT_ROOT / "models" / "metrics"
 
@@ -48,11 +51,7 @@ def _parse_int_list(s: str) -> List[int]:
 # ---------------------------------------------------------------------------
 
 def find_latest_model(pattern: str = "model_*_baseline.pkl") -> Optional[Path]:
-    """Return the most recent model artifact if any exist.
-
-    Picks the most recently modified `model_*.pkl` file from the artifacts
-    directory to avoid missing models saved with custom tags.
-    """
+    """Return the most recent model artifact."""
     try:
         files = list(ARTIFACTS_PATH.glob("model_*.pkl"))
         if not files:
@@ -113,14 +112,11 @@ def compute_metrics(y_true: pd.Series, y_pred: np.ndarray) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# Feature alignment (avoids SettingWithCopyWarning)
+# Feature alignment
 # ---------------------------------------------------------------------------
 
 def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
-    """Align a DataFrame to the model's expected features.
-
-    Uses explicit .copy() and .loc[] to avoid SettingWithCopyWarning.
-    """
+    """Align a DataFrame to the model's expected features."""
     if not hasattr(model, "feature_names_in_"):
         return X.copy()
 
@@ -137,7 +133,6 @@ def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
     if extra:
         out = out.drop(columns=extra)
 
-    # Reorder
     return out[expected]
 
 
@@ -178,7 +173,7 @@ def evaluate(
     model_path: Optional[Path] = None,
     lags: Optional[List[int]] = None,
     windows: Optional[List[int]] = None,
-    horizon: int = 30,
+    horizon: int = 60,
 ) -> Dict[str, Any]:
     """Full evaluation pipeline (group-aware, no aggregation).
 
@@ -208,8 +203,7 @@ def evaluate(
         encoders = None
         logger.info("[evaluate] Using shared config: lags=%s, windows=%s", lags, windows)
 
-    # 2. Load raw features CSV (NOT aggregated)
-    # If the model config saved the original training features path, prefer it
+    # 2. Load raw data
     features_source = FEATURES_PATH
     if model_config and model_config.get("training_features_path"):
         cand = Path(model_config.get("training_features_path"))
@@ -218,119 +212,57 @@ def evaluate(
             logger.info("[evaluate] Using model's training features source: %s", features_source)
 
     if not features_source.exists():
-        raise FileNotFoundError(f"Features file not found at {features_source}")
+        # Try interim path
+        if INTERIM_PATH.exists():
+            features_source = INTERIM_PATH
+            logger.info("[evaluate] Falling back to interim data: %s", features_source)
+        else:
+            raise FileNotFoundError(f"Features file not found at {features_source}")
 
     df = pd.read_csv(features_source, parse_dates=["date"])
-    # Robust group detection: accept common aliases (e.g. 'store' or 'id' for 'store_id')
-    # Determine actual group column names present in the dataframe (use aliases)
-    available_groups = []
-    for g in GROUP_COLS:
-        if g in df.columns:
-            available_groups.append(g)
-            continue
-        # common aliases: prefer the literal alias present in the dataframe
-        if g == "store_id":
-            if "store" in df.columns:
-                available_groups.append("store")
-                continue
-            if "id" in df.columns:
-                available_groups.append("id")
-                continue
-        if g == "product_id":
-            if "product_id" in df.columns:
-                available_groups.append("product_id")
-                continue
-            if "product" in df.columns:
-                available_groups.append("product")
-                continue
+
+    # Detect group and categorical columns
+    available_groups = [c for c in GROUP_COLS if c in df.columns]
+    # Handle aliases
+    if "store_id" not in df.columns and "id" in df.columns:
+        df = df.rename(columns={"id": "store_id"})
+        if "store_id" not in available_groups:
+            available_groups.append("store_id")
+
     cat_cols = [c for c in CATEGORICAL_FEATURES if c in df.columns]
     sort_cols = available_groups + ["date"]
     df = df.sort_values(sort_cols).reset_index(drop=True)
 
+    # Handle on_promo
+    if "on_promo" in df.columns:
+        df["on_promo"] = df["on_promo"].map(
+            {True: 1, False: 0, "True": 1, "False": 0, 1: 1, 0: 0}
+        ).fillna(0).astype(int)
+
     logger.info("[evaluate] Loaded %d rows, groups: %s", len(df), available_groups)
 
-    # Rebuild features (group-aware)
-    # If the features file does not contain columns expected by the model
-    # (e.g. categorical/group columns), attempt to regenerate features from a
-    # cleaned interim file so the evaluation and model expectations align.
-    expected_features = set()
-    if hasattr(model, "feature_names_in_"):
-        expected_features = set(model.feature_names_in_)
-
-    missing_expected = [c for c in expected_features if c not in df.columns]
-    if missing_expected:
-        logger.warning(
-            "[evaluate] Detected missing expected features: %s. "
-            "Attempting to regenerate features from cleaned data...",
-            missing_expected,
-        )
-        # Find a cleaned interim file to rebuild features
-        try:
-            interim_dir = PROJECT_ROOT / "data" / "interim"
-            clean_files = sorted(interim_dir.glob("*_clean.csv"), reverse=True) if interim_dir.exists() else []
-            if clean_files:
-                    src_clean = clean_files[0]
-                    logger.info("[evaluate] Using %s to rebuild features", src_clean)
-                    df_clean = pd.read_csv(src_clean, parse_dates=["date"]) if src_clean.exists() else None
-                    if df_clean is not None:
-                        try:
-                            # When rebuilding from the cleaned source, let the feature
-                            # pipeline detect group columns / aliases from that file
-                            # rather than using the group columns inferred from the
-                            # training features file (they may use different names).
-                            result = build_feature_pipeline(
-                                df_clean, lags=lags, windows=windows,
-                                group_cols=None,
-                                categorical_cols=None,
-                                encoders=encoders,
-                            )
-                            if isinstance(result, tuple) and len(result) == 2:
-                                df, _ = result
-                            else:
-                                df = result
-                            # Persist regenerated features to FEATURES_PATH for reproducibility
-                            try:
-                                FEATURES_PATH.parent.mkdir(parents=True, exist_ok=True)
-                                df.to_csv(FEATURES_PATH, index=False)
-                                logger.info("[evaluate] Regenerated features saved to %s", FEATURES_PATH)
-                            except Exception:
-                                pass
-                        except Exception as e:
-                            logger.error("[evaluate] Failed to rebuild features from %s: %s", src_clean, e)
-
-            else:
-                logger.warning("[evaluate] No cleaned interim file found to regenerate features.")
-        except Exception as e:
-            logger.error("[evaluate] Error during feature regeneration attempt: %s", e)
-
-    else:
-        # Normal path: rebuild features from the loaded features file (no regen needed)
-        pass
-
-    # Now run the feature pipeline on the (possibly regenerated) dataframe
+    # Run feature pipeline
     result = build_feature_pipeline(
         df, lags=lags, windows=windows,
         group_cols=available_groups if available_groups else None,
         categorical_cols=cat_cols if cat_cols else None,
         encoders=encoders,
+        is_train=False,
     )
     if isinstance(result, tuple) and len(result) == 2:
         df, _ = result
     else:
         df = result
-        if encoders is None:
-            encoders = getattr(df, "attrs", {}).get("encoders", None)
+
     df = df.dropna().reset_index(drop=True)
     logger.info("[evaluate] After feature engineering: %d rows, %d columns", len(df), len(df.columns))
 
-    # 3. Split by date cutoff (same logic as train.py)
+    # 3. Split by date cutoff
     unique_dates = sorted(df["date"].unique())
     effective_horizon = horizon
     if effective_horizon >= len(unique_dates):
         effective_horizon = max(1, len(unique_dates) // 5)
-        logger.warning(
-            "[evaluate] Adjusted horizon to %d (not enough unique dates)", effective_horizon
-        )
+        logger.warning("[evaluate] Adjusted horizon to %d (not enough unique dates)", effective_horizon)
 
     cutoff_date = unique_dates[-effective_horizon]
     train_mask = df["date"] < cutoff_date
@@ -346,9 +278,7 @@ def evaluate(
 
     logger.info(
         "[evaluate] Train: %d samples, Test: %d samples, cutoff_date=%s",
-        len(y_train),
-        len(y_test),
-        cutoff_date,
+        len(y_train), len(y_test), cutoff_date,
     )
 
     # 4. Align features to model expectations
@@ -362,15 +292,8 @@ def evaluate(
         extra = set(feature_cols) - expected
         logger.info(
             "[evaluate] Features: %d matched, %d filled with 0, %d dropped",
-            len(matched),
-            len(missing),
-            len(extra),
+            len(matched), len(missing), len(extra),
         )
-        if missing:
-            logger.warning(
-                "[evaluate] These model features were filled with 0: %s",
-                sorted(missing),
-            )
 
     # Diagnostics
     diagnostics = _diagnose_data(y_train, y_test)
@@ -381,19 +304,10 @@ def evaluate(
     y_pred_train = model.predict(X_train)
     y_pred_test = model.predict(X_test)
 
-    # If model used a target transform during training, invert predictions
-    tform = model_config.get("target_transform") if model_config else None
-    if tform == "log1p":
-        try:
-            y_pred_train = np.expm1(y_pred_train)
-            y_pred_test = np.expm1(y_pred_test)
-        except Exception:
-            logger.warning("[evaluate] Failed to invert target transform on predictions")
-
     train_metrics = compute_metrics(y_train, y_pred_train)
     test_metrics = compute_metrics(y_test, y_pred_test)
 
-    overfit_ratio = test_metrics["MAE"] / train_metrics["MAE"] if train_metrics["MAE"] > 0 else float("inf")
+    overfit_ratio = test_metrics["RMSE"] / train_metrics["RMSE"] if train_metrics["RMSE"] > 0 else float("inf")
 
     results = {
         "model_path": str(actual_path),
@@ -431,16 +345,22 @@ def _print_interpretation(results: Dict[str, Any]) -> None:
     print(f"  Overfit ratio: {results['overfit_ratio']:.2f}")
 
     r2 = test["R2"]
-    if r2 < 0:
-        print("  VERDICT: Model is WORSE than the mean -- predictions are not useful.")
-    elif r2 < 0.3:
-        print("  VERDICT: Weak model -- captures very little signal.")
-    elif r2 < 0.7:
-        print("  VERDICT: Moderate model -- captures some patterns but can improve.")
-    else:
+    if r2 >= 0.85:
+        print("  VERDICT: Excellent model -- strong predictive power.")
+    elif r2 >= 0.7:
         print("  VERDICT: Good model -- explains significant variance in the data.")
+    elif r2 >= 0.5:
+        print("  VERDICT: Moderate model -- captures key patterns but can improve.")
+    elif r2 >= 0.3:
+        print("  VERDICT: Weak model -- captures very little signal.")
+    elif r2 >= 0:
+        print("  VERDICT: Poor model -- barely better than the mean.")
+    else:
+        print("  VERDICT: Model is WORSE than the mean -- predictions are not useful.")
 
-    if results["overfit_ratio"] > 3.0:
+    if results["overfit_ratio"] > 2.0:
+        print("  WARNING: Significant overfitting detected (ratio > 2x).")
+    elif results["overfit_ratio"] > 3.0:
         print("  WARNING: Severe overfitting detected (ratio > 3x).")
     if abs(test.get("Bias", 0)) > test["MAE"] * 0.5:
         direction = "over" if test["Bias"] > 0 else "under"
@@ -457,7 +377,7 @@ def main(argv=None) -> int:
     parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--lags", default=None)
     parser.add_argument("--windows", default=None)
-    parser.add_argument("--horizon", type=int, default=30)
+    parser.add_argument("--horizon", type=int, default=60)
     parser.add_argument("--save", action="store_true")
     args = parser.parse_args(argv)
 
@@ -468,7 +388,8 @@ def main(argv=None) -> int:
         results = evaluate(model_path=args.model, lags=lags, windows=windows, horizon=args.horizon)
     except Exception as e:
         print(f"[evaluate] Error: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return 1
 
     if args.save:

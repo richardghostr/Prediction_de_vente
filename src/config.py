@@ -28,8 +28,8 @@ ARCHIVE_DIR = ROOT / "archive"
 RANDOM_SEED = 42
 
 # Feature config (must match between train and predict)
-PREDICT_LAGS = [1, 7, 14]
-PREDICT_WINDOWS = [7, 14]
+PREDICT_LAGS = [1, 2, 3, 7, 14, 21, 28]
+PREDICT_WINDOWS = [7, 14, 28]
 
 # Group columns: each unique (store, product) combination is a separate time series.
 # Lags and rolling features MUST be computed within each group to avoid data leakage.
@@ -43,7 +43,7 @@ BINARY_FEATURES = ["on_promo"]
 
 # Columns to exclude from model features (identifiers / targets that would cause leakage)
 # NOTE: store_id and product_id are ENCODED separately, their raw text is excluded here.
-FEATURE_EXCLUDE = {"value", "date", "id", "category", "revenue", "unit_price"}
+FEATURE_EXCLUDE = {"value", "date", "id", "category", "revenue", "unit_price", "email", "quantity"}
 
 # Date formatting
 DATE_FORMAT = "%Y-%m-%d"
