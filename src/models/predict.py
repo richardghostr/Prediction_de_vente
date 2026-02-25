@@ -1,7 +1,7 @@
 """Prediction module for sales forecasting.
 
 Group-aware version: supports multi-series predictions with store/product identity.
-No scaling hack -- model was trained on raw values, so we predict on raw values.
+Supports LightGBM, XGBoost, and ensemble models.
 
 Usage (standalone test):
     python -m src.models.predict
@@ -10,10 +10,9 @@ Usage (standalone test):
 import json
 import math
 import os
-import re
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 import numpy as np
@@ -39,12 +38,14 @@ _MODEL_CONFIG = None
 
 
 def _find_model() -> Optional[Path]:
-    """Find the most recent model artifact."""
-    for pattern in ["model_*_improved.pkl", "model_*_baseline.pkl"]:
+    """Find the most recent model artifact, preferring ensemble > improved > baseline."""
+    for pattern in ["model_*_ensemble.pkl", "model_*_improved.pkl", "model_*_baseline.pkl"]:
         files = sorted(ARTIFACTS_PATH.glob(pattern))
         if files:
             return files[-1]
-    return None
+    # Fallback: any pkl
+    files = sorted(ARTIFACTS_PATH.glob("model_*.pkl"))
+    return files[-1] if files else None
 
 
 def _load_model_config(model_path: Path) -> Dict[str, Any]:
@@ -95,7 +96,12 @@ def get_model():
     _MODEL_PATH = mp
     _MODEL = joblib.load(mp)
     _MODEL_CONFIG = _load_model_config(mp)
-    print(f"[predict] Loaded: {mp.name} (type={type(_MODEL).__name__})")
+    model_type = type(_MODEL).__name__
+    if model_type == "EnsembleRegressor":
+        inner_types = [type(m).__name__ for m in _MODEL.models]
+        print(f"[predict] Loaded: {mp.name} (Ensemble of {inner_types})")
+    else:
+        print(f"[predict] Loaded: {mp.name} (type={model_type})")
     return _MODEL
 
 
@@ -122,7 +128,7 @@ def get_model_config() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
-    """Align DataFrame columns to model expectations. Uses .copy()/.loc[] to be safe."""
+    """Align DataFrame columns to model expectations."""
     expected = None
     if hasattr(model, "feature_names_in_"):
         expected = list(model.feature_names_in_)
@@ -157,42 +163,23 @@ def predict_series(
 ) -> Dict[str, Any]:
     """Predict future values given a historical series.
 
-    NO SCALING: model was trained on raw values, so we predict on raw values.
-    This eliminates the systematic bias caused by the old scale/unscale hack.
-
     Args:
         series: list of dicts with at least 'date' and 'value' keys.
-                Optionally 'store_id', 'product_id', 'on_promo' for group-aware prediction.
+                Optionally 'store_id', 'product_id', 'on_promo'.
         horizon: number of future days to forecast.
-        lags/windows: override feature config (default: from model config or shared config).
+        lags/windows: override feature config.
 
     Returns:
-        dict: {
-            "id": None,
-            "forecast": [{"ds": ..., "yhat": ...}, ...],
-            "method": ...,
-            "warning": ...,
-            "min_history_required": ...,
-            "actual_history": ...,
-        }
-
-    Notes:
-        Si le modèle a été entraîné avec un biais systématique (Bias_train),
-        un terme de correction `bias_correction = -Bias_train` est stocké
-        dans la config du modèle et appliqué ici :
-
-            yhat = yhat_raw + bias_correction
+        dict with forecast, method, warnings, etc.
     """
     model = get_model()
     config = get_model_config()
 
-    # Resolve lags/windows from model config -> CLI -> shared config
     if lags is None:
         lags = config.get("lags", PREDICT_LAGS)
     if windows is None:
         windows = config.get("windows", PREDICT_WINDOWS)
 
-    # Get encoders & éventuelle correction de biais depuis la config
     encoders = config.get("encoders")
     bias_correction = float(config.get("bias_correction", 0.0))
 
@@ -211,9 +198,8 @@ def predict_series(
     if "value" not in df.columns:
         df["value"] = pd.NA
 
-    # Keep group columns if available for group-aware features
     keep_cols = ["date", "value"]
-    for col in ["store_id", "product_id", "on_promo"]:
+    for col in ["store_id", "product_id", "on_promo", "price"]:
         if col in df.columns:
             keep_cols.append(col)
     df = df[keep_cols].copy()
@@ -223,7 +209,6 @@ def predict_series(
     if last_val is None:
         raise ValueError("No observed values to base forecast on")
 
-    # If no feature pipeline or model is dummy, use naive forecast
     if build_feature_pipeline is None or _is_dummy_model(model):
         out = _naive_forecast(df, last_val, horizon)
         out["method"] = "naive"
@@ -239,7 +224,6 @@ def predict_series(
             "Predictions may be less accurate with limited history."
         )
 
-    # Detect group columns
     group_cols = [c for c in ["store_id", "product_id"] if c in df.columns]
     cat_cols = [c for c in ["store_id", "product_id"] if c in df.columns]
 
@@ -257,6 +241,7 @@ def predict_series(
                 group_cols=group_cols if group_cols else None,
                 categorical_cols=cat_cols if cat_cols else None,
                 encoders=encoders,
+                is_train=False,
             )
         except Exception:
             feats = None
@@ -273,13 +258,10 @@ def predict_series(
                 X_last = X_clean.iloc[[-1]]
                 X_last = _align_features_to_model(X_last, model)
                 raw = float(model.predict(X_last)[0])
-                # applique la correction de biais si définie dans la config
                 raw_corrected = raw + bias_correction
                 yhat = raw_corrected if math.isfinite(raw_corrected) else float(last_val)
 
-        # Clamp to non-negative (quantities can't be negative)
         yhat = max(0.0, yhat)
-
         if not math.isfinite(yhat):
             yhat = float(last_val)
 
@@ -287,21 +269,21 @@ def predict_series(
         next_date = last_date + pd.Timedelta(days=1)
         forecast.append({"ds": next_date.strftime("%Y-%m-%d"), "yhat": round(yhat, 2)})
 
-        # Append predicted value to history for next autoregressive step
         new_row = {"date": next_date, "value": yhat}
-        # Carry forward group columns if present
         for col in group_cols:
             if col in history.columns:
                 new_row[col] = history[col].iloc[-1]
         if "on_promo" in history.columns:
-            new_row["on_promo"] = 0  # Assume no promo for future dates by default
+            new_row["on_promo"] = 0
+        if "price" in history.columns:
+            new_row["price"] = history["price"].iloc[-1]
 
         history = pd.concat([history, pd.DataFrame([new_row])], ignore_index=True)
 
     return {
         "id": None,
         "forecast": forecast,
-        "method": "xgboost",
+        "method": "xgboost" if not hasattr(model, "models") else "ensemble",
         "warning": warning,
         "min_history_required": min_history,
         "actual_history": n_history,
