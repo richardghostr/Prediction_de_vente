@@ -8,6 +8,8 @@ from typing import Dict, List, Any
 
 import numpy as np
 import pandas as pd
+import yaml
+from pathlib import Path
 
 try:
     from rapidfuzz.fuzz import ratio
@@ -137,3 +139,59 @@ def apply_mapping_and_transform(
             except Exception as e:
                 print(f"Avertissement: impossible de convertir '{col}' en '{dtype}': {e}")
     return transformed_df
+
+
+def find_best_mapping(df: pd.DataFrame, targets: List[str], aliases: Dict[str, List[str]]) -> Dict[str, str]:
+    """Backward-compatible wrapper attendu par `ingest.py`.
+    Délègue à `find_best_mapping_optimize` en garantissant la signature.
+    """
+    return find_best_mapping_optimize(df, targets, aliases)
+
+
+def validate_transformed_df(df: pd.DataFrame, rules: Dict[str, Any]) -> List[str]:
+    """Valide `df` selon les règles simples définies dans la config.
+    Retourne une liste d'avertissements/erreurs (vide si ok).
+    """
+    issues: List[str] = []
+    if not rules:
+        return issues
+
+    # Vérifier min/max sur 'value'
+    value_rules = rules.get('value', {}) if isinstance(rules, dict) else {}
+    if 'value' in df.columns and value_rules:
+        ser = df['value']
+        if 'min' in value_rules:
+            minv = value_rules['min']
+            if ser.dropna().lt(minv).any():
+                issues.append(f"value < min ({minv}) détecté")
+        if 'max' in value_rules:
+            maxv = value_rules['max']
+            if ser.dropna().gt(maxv).any():
+                issues.append(f"value > max ({maxv}) détecté")
+
+    # Seuils de valeurs manquantes
+    missing = rules.get('missing_thresholds', {}) if isinstance(rules, dict) else {}
+    for col, thresh in missing.items():
+        if col in df.columns:
+            perc = df[col].isna().mean()
+            if perc > float(thresh):
+                issues.append(f"Colonne '{col}' a {perc:.2%} manquants (> {float(thresh):.2%})")
+
+    return issues
+
+
+def load_config(path: Path | str) -> Dict[str, Any]:
+    """Charge un fichier YAML de configuration et renvoie un dict.
+    Accepte un `Path` ou une chaine. Lance FileNotFoundError si absent.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    with p.open('r', encoding='utf-8') as fh:
+        cfg = yaml.safe_load(fh)
+    # Assurer des clés minimales
+    cfg.setdefault('targets', ['id', 'date', 'value'])
+    cfg.setdefault('aliases', {})
+    cfg.setdefault('data_types', {})
+    cfg.setdefault('validation_rules', {})
+    return cfg

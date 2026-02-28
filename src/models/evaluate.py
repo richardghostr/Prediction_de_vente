@@ -30,14 +30,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.data.features import build_feature_pipeline
 from src.config import (
     PREDICT_LAGS, PREDICT_WINDOWS, FEATURE_EXCLUDE,
-    GROUP_COLS, CATEGORICAL_FEATURES,
+    GROUP_COLS, CATEGORICAL_FEATURES, TEST_CSV,
 )
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "uploaded_generated_training_10950_features.csv"
-INTERIM_PATH = PROJECT_ROOT / "data" / "interim" / "generated_training_10950_clean.csv"
 ARTIFACTS_PATH = PROJECT_ROOT / "models" / "artifacts"
 METRICS_PATH = PROJECT_ROOT / "models" / "metrics"
 
@@ -204,22 +202,31 @@ def evaluate(
         logger.info("[evaluate] Using shared config: lags=%s, windows=%s", lags, windows)
 
     # 2. Load raw data
-    features_source = FEATURES_PATH
+    # Priority: model_config.training_features_path > INTERIM test split (TEST_CSV) > processed feature fallback
+    features_source = None
     if model_config and model_config.get("training_features_path"):
         cand = Path(model_config.get("training_features_path"))
         if cand.exists():
             features_source = cand
             logger.info("[evaluate] Using model's training features source: %s", features_source)
 
-    if not features_source.exists():
-        # Try interim path
-        if INTERIM_PATH.exists():
-            features_source = INTERIM_PATH
-            logger.info("[evaluate] Falling back to interim data: %s", features_source)
+    if features_source is None:
+        if TEST_CSV.exists():
+            features_source = TEST_CSV
+            logger.info("[evaluate] Using interim test CSV: %s", features_source)
         else:
-            raise FileNotFoundError(f"Features file not found at {features_source}")
+            fallback = PROJECT_ROOT / "data" / "processed" / "train_features.csv"
+            if fallback.exists():
+                features_source = fallback
+            else:
+                sample = PROJECT_ROOT / "data" / "processed" / "train_features.csv"
+                if sample.exists():
+                    features_source = sample
+                else:
+                    logger.error("[evaluate] No data file found. Ensure data/interim/test.csv or processed features exist.")
+                    return 1
 
-    df = pd.read_csv(features_source, parse_dates=["date"])
+    df = pd.read_csv(features_source, parse_dates=["date"]) 
 
     # Detect group and categorical columns
     available_groups = [c for c in GROUP_COLS if c in df.columns]
@@ -284,6 +291,20 @@ def evaluate(
     # 4. Align features to model expectations
     X_train = _align_features_to_model(X_train, model)
     X_test = _align_features_to_model(X_test, model)
+
+    # Ensure feature matrices contain only numeric dtypes for tree libraries
+    def _coerce_object_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+        df_out = df_in.copy()
+        for c in df_out.columns:
+            if pd.api.types.is_object_dtype(df_out[c].dtype) or isinstance(df_out[c].dtype, pd.CategoricalDtype):
+                try:
+                    df_out[c] = pd.Categorical(df_out[c]).codes
+                except Exception:
+                    df_out[c] = pd.to_numeric(df_out[c], errors="coerce").fillna(0).astype(float)
+        return df_out
+
+    X_train = _coerce_object_columns(X_train)
+    X_test = _coerce_object_columns(X_test)
 
     if hasattr(model, "feature_names_in_"):
         expected = set(model.feature_names_in_)

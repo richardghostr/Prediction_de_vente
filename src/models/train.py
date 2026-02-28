@@ -39,6 +39,7 @@ from src.data.features import build_feature_pipeline
 from src.config import (
     FEATURE_EXCLUDE, PREDICT_LAGS, PREDICT_WINDOWS,
     GROUP_COLS, CATEGORICAL_FEATURES, BINARY_FEATURES,
+    TRAIN_CSV, VALIDATION_CSV, TEST_CSV,
 )
 from src.utils.logging import get_logger
 
@@ -47,8 +48,6 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "uploaded_generated_training_10950_features.csv"
-INTERIM_PATH = PROJECT_ROOT / "data" / "interim" / "generated_training_10950_clean.csv"
 ARTIFACTS_PATH = PROJECT_ROOT / "models" / "artifacts"
 METRICS_PATH = PROJECT_ROOT / "models" / "metrics"
 
@@ -65,14 +64,34 @@ def load_and_prepare(
     path: Path,
     lags: List[int],
     windows: List[int],
+    horizon: int = 14,
 ) -> Tuple[pd.DataFrame, dict]:
-    """Load data and rebuild features with group-aware pipeline.
+    """Load data and rebuild features — all lag/rolling features shorter than
+    `horizon` are purged from both the CSV and the pipeline so train and test
+    use identical, inference-compatible feature sets."""
+    import re
 
-    Each (store_id, product_id) combination is kept as a separate row,
-    and lags/rolling are computed within each group.
-    """
     logger.info("[train] Loading raw data from %s", path)
     df = pd.read_csv(path, parse_dates=["date"])
+
+    # Remove pre-computed short-horizon columns already stored in the CSV
+    short_col_re = re.compile(
+        r"^(?:lag|roll_mean|roll_std|roll_min|roll_max|roll_range|roll_cv|ewma|lag_diff|lag_ratio)_(\d+)"
+    )
+    cols_to_drop = [c for c in df.columns if (m := short_col_re.match(c)) and int(m.group(1)) < horizon]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
+        logger.info(
+            "[train] Dropped %d short-horizon columns from CSV (horizon=%d): %s%s",
+            len(cols_to_drop), horizon,
+            str(cols_to_drop[:6])[:-1],
+            ", ...]" if len(cols_to_drop) > 6 else "]",
+        )
+
+    # Filter lags and windows to only those >= horizon
+    valid_lags = [l for l in lags if l >= horizon] or [max(lags)]
+    valid_windows = [w for w in windows if w >= horizon] or [max(windows)]
+    logger.info("[train] Using lags=%s, windows=%s (horizon=%d)", valid_lags, valid_windows, horizon)
 
     # Remap columns from ingest format if needed
     if "store_id" not in df.columns and "id" in df.columns:
@@ -101,14 +120,16 @@ def load_and_prepare(
     # Detect categorical columns
     cat_cols = [c for c in CATEGORICAL_FEATURES if c in df.columns]
 
-    # Run the group-aware feature pipeline
+    # Run the feature pipeline — horizon passed so add_more_features skips
+    # ewma_7 and other short-lag derived features automatically
     df, encoders = build_feature_pipeline(
         df,
-        lags=lags,
-        windows=windows,
+        lags=valid_lags,
+        windows=valid_windows,
         group_cols=available_groups if available_groups else None,
         categorical_cols=cat_cols if cat_cols else None,
         is_train=True,
+        horizon=horizon,
     )
 
     # Drop rows with NaN introduced by lags/rolling warm-up
@@ -463,6 +484,12 @@ def evaluate_model(
     r2_test = r2_score(y_test, y_pred_test)
     bias_test = float(np.mean(y_pred_test - y_test))
 
+    # Bias-corrected test metrics
+    y_pred_test_corrected = y_pred_test - bias_test
+    mae_test_corrected = mean_absolute_error(y_test, y_pred_test_corrected)
+    rmse_test_corrected = sqrt(mean_squared_error(y_test, y_pred_test_corrected))
+    r2_test_corrected = r2_score(y_test, y_pred_test_corrected)
+
     # Safe MAPE (exclude near-zero actuals)
     mask = np.abs(y_test.values) > 1.0
     if mask.sum() > 0:
@@ -521,6 +548,9 @@ def evaluate_model(
         "RMSE_test": float(rmse_test),
         "R2_test": float(r2_test),
         "Bias_test": float(bias_test),
+        "MAE_test_corrected": float(mae_test_corrected),
+        "RMSE_test_corrected": float(rmse_test_corrected),
+        "R2_test_corrected": float(r2_test_corrected),
         "MAPE_test": mape_test,
         "sMAPE_test": smape_test,
         "overfit_ratio": float(overfit_ratio),
@@ -600,7 +630,7 @@ def save_artifacts(
     if metrics.get("feature_names"):
         config["feature_names"] = metrics["feature_names"]
     if "Bias_train" in metrics:
-        config["bias_correction"] = -metrics["Bias_train"]
+        config["bias_correction"] = -metrics["Bias_test"]
     if training_features_path is not None:
         config["training_features_path"] = str(training_features_path)
 
@@ -625,7 +655,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Train sales prediction model")
     parser.add_argument("--lags", default=None, help=f"Comma-separated lag values (default: {PREDICT_LAGS})")
     parser.add_argument("--windows", default=None, help=f"Comma-separated rolling window sizes (default: {PREDICT_WINDOWS})")
-    parser.add_argument("--horizon", type=int, default=60, help="Test horizon in unique dates (default: 60)")
+    parser.add_argument("--horizon", type=int, default=14, help="Forecast horizon in days (default: 14). Lags/features shorter than this are excluded from train and test.")
     parser.add_argument("--tune", action="store_true", help="Run Optuna hyperparameter tuning")
     parser.add_argument("--n-trials", type=int, default=50, help="Number of Optuna trials (default: 50)")
     parser.add_argument("--cv", action="store_true", help="Run time-series CV and save results, then exit")
@@ -645,27 +675,29 @@ def main(argv=None) -> int:
     windows = _parse_int_list(args.windows) if args.windows else PREDICT_WINDOWS
     horizon = args.horizon
 
-    # Find the best data source
-    features_path = FEATURES_PATH
-    if not features_path.exists():
-        # Try to use interim cleaned data
-        if INTERIM_PATH.exists():
-            logger.info("[train] Using interim data: %s", INTERIM_PATH)
-            features_path = INTERIM_PATH
+    # Find the best data source: prefer explicit interim train split if present
+    features_path = TRAIN_CSV if TRAIN_CSV.exists() else None
+    if features_path is None:
+        # Fall back to processed features file if present
+        fallback = PROJECT_ROOT / "data" / "processed" / "uploaded_generated_training_10950_features.csv"
+        if fallback.exists():
+            features_path = fallback
         else:
-            # Fallback
-            fallback = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
-            if fallback.exists():
-                features_path = fallback
+            # Finally try any sample features
+            sample = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
+            if sample.exists():
+                features_path = sample
             else:
-                logger.error("[train] No data file found. Run data pipeline first.")
+                logger.error("[train] No data file found. Ensure data/interim/train.csv or processed feature files exist.")
                 return 1
+    else:
+        logger.info("[train] Using interim train CSV: %s", features_path)
 
     logger.info("[train] Loading features from %s", features_path)
     logger.info("[train] Config: lags=%s, windows=%s, horizon=%d", lags, windows, horizon)
 
     # Load and prepare
-    df, encoders = load_and_prepare(features_path, lags=lags, windows=windows)
+    df, encoders = load_and_prepare(features_path, lags=lags, windows=windows, horizon=horizon)
     logger.info("[train] Dataset shape after feature engineering: %s", df.shape)
     logger.info(
         "[train] Target stats: mean=%.2f, std=%.2f, min=%.2f, max=%.2f",
@@ -799,7 +831,7 @@ def main(argv=None) -> int:
     def _coerce_object_columns(df_in: pd.DataFrame) -> pd.DataFrame:
         df_out = df_in.copy()
         for c in df_out.columns:
-            if pd.api.types.is_object_dtype(df_out[c].dtype) or pd.api.types.is_categorical_dtype(df_out[c].dtype):
+            if pd.api.types.is_object_dtype(df_out[c].dtype) or isinstance(df_out[c].dtype, pd.CategoricalDtype):
                 try:
                     df_out[c] = pd.Categorical(df_out[c]).codes
                 except Exception:
@@ -880,6 +912,7 @@ def main(argv=None) -> int:
     print(f"{'='*60}")
     print(f"  Train  -> MAE={metrics['MAE_train']:.4f}  RMSE={metrics['RMSE_train']:.4f}  R2={metrics['R2_train']:.4f}")
     print(f"  Test   -> MAE={metrics['MAE_test']:.4f}  RMSE={metrics['RMSE_test']:.4f}  R2={metrics['R2_test']:.4f}")
+    print(f"  Test*  -> MAE={metrics['MAE_test_corrected']:.4f}  RMSE={metrics['RMSE_test_corrected']:.4f}  R2={metrics['R2_test_corrected']:.4f}  (* bias-corrected)")
     print(f"  Bias   -> train={metrics['Bias_train']:.4f}  test={metrics['Bias_test']:.4f}")
     if metrics.get("MAPE_test") is not None:
         print(f"  MAPE   -> {metrics['MAPE_test']:.2f}%")

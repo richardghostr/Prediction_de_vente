@@ -211,8 +211,12 @@ def add_lag_interactions(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_more_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add extra engineered features: ratios, diffs, EWMA, crossed categories, and holiday flag hook."""
+def add_more_features(df: pd.DataFrame, horizon: int = 1) -> pd.DataFrame:
+    """Add extra engineered features: ratios, diffs, EWMA, crossed categories, and holiday flag hook.
+
+    `horizon`: forecast horizon in days. Features based on lags shorter than
+    this value are skipped because they would not be available at inference time.
+    """
     df = df.copy()
 
     # Ratios and differences between typical lags
@@ -220,14 +224,15 @@ def add_more_features(df: pd.DataFrame) -> pd.DataFrame:
         df["ratio_lag7_lag14"] = df["lag_7"] / (df["lag_14"].replace(0, np.nan) + 1e-9)
         df["diff_lag7_lag14"] = df["lag_7"] - df["lag_14"]
 
-    # EWMA on value (if not already present for requested spans)
-    if "ewma_7" not in df.columns and "value" in df.columns:
+    # EWMA on value — only add if lag-7 is available (i.e. horizon <= 7)
+    # and not already present from add_ewma_features()
+    if horizon <= 7 and "ewma_7" not in df.columns and "value" in df.columns:
         if "store_id" in df.columns:
             df["ewma_7"] = df.groupby("store_id")["value"].transform(
-                lambda x: x.ewm(span=7, min_periods=3).mean()
+                lambda x: x.shift(1).ewm(span=7, min_periods=3).mean()
             )
         else:
-            df["ewma_7"] = df["value"].ewm(span=7, min_periods=3).mean()
+            df["ewma_7"] = df["value"].shift(1).ewm(span=7, min_periods=3).mean()
 
     # Crossed categorical features (string concat then label-encode later)
     if "store_id" in df.columns and "dayofweek" in df.columns:
@@ -388,6 +393,7 @@ def build_feature_pipeline(
     categorical_cols: Optional[List[str]] = None,
     encoders: Optional[dict] = None,
     is_train: bool = True,
+    horizon: int = 1,
 ) -> tuple:
     """Full feature engineering pipeline.
 
@@ -443,8 +449,8 @@ def build_feature_pipeline(
     # 5. Lag interaction features
     df = add_lag_interactions(df)
 
-    # 5.5 Additional engineered features
-    df = add_more_features(df)
+    # 5.5 Additional engineered features (horizon-aware: skips ewma_7 if horizon > 7)
+    df = add_more_features(df, horizon=horizon)
 
     # 6. Target encoding for categorical columns (Bayesian smoothed)
     target_enc_cols = [c for c in (group_cols or []) if c in df.columns and df[c].dtype == "object"]

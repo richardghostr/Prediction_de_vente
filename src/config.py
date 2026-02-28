@@ -18,6 +18,11 @@ RAW_DIR = DATA_DIR / "raw"
 INTERIM_DIR = DATA_DIR / "interim"
 PROCESSED_DIR = DATA_DIR / "processed"
 
+# Default interim split files (expected to be created by the pipeline)
+TRAIN_CSV = INTERIM_DIR / "train.csv"
+VALIDATION_CSV = INTERIM_DIR / "validation.csv"
+TEST_CSV = INTERIM_DIR / "test.csv"
+
 # Models and artifacts
 MODELS_DIR = ROOT / "models"
 MODELS_ARTIFACTS_DIR = MODELS_DIR / "artifacts"
