@@ -211,6 +211,38 @@ def add_lag_interactions(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_more_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add extra engineered features: ratios, diffs, EWMA, crossed categories, and holiday flag hook."""
+    df = df.copy()
+
+    # Ratios and differences between typical lags
+    if "lag_7" in df.columns and "lag_14" in df.columns:
+        df["ratio_lag7_lag14"] = df["lag_7"] / (df["lag_14"].replace(0, np.nan) + 1e-9)
+        df["diff_lag7_lag14"] = df["lag_7"] - df["lag_14"]
+
+    # EWMA on value (if not already present for requested spans)
+    if "ewma_7" not in df.columns and "value" in df.columns:
+        if "store_id" in df.columns:
+            df["ewma_7"] = df.groupby("store_id")["value"].transform(
+                lambda x: x.ewm(span=7, min_periods=3).mean()
+            )
+        else:
+            df["ewma_7"] = df["value"].ewm(span=7, min_periods=3).mean()
+
+    # Crossed categorical features (string concat then label-encode later)
+    if "store_id" in df.columns and "dayofweek" in df.columns:
+        df["store_dayofweek"] = df["store_id"].astype(str) + "_" + df["dayofweek"].astype(str)
+    if "month" in df.columns and "store_id" in df.columns:
+        df["month_store"] = df["month"].astype(str) + "_" + df["store_id"].astype(str)
+
+    # Holiday hook: caller can populate a list of holiday dates and set df['is_holiday'] accordingly
+    # Example usage (outside this function):
+    # holiday_dates = {pd.Timestamp('2025-01-01'), pd.Timestamp('2025-12-25')}
+    # df['is_holiday'] = df['date'].dt.floor('D').isin(holiday_dates).astype(int)
+
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Categorical encoding (label encoding for tree-based models)
 # ---------------------------------------------------------------------------
@@ -238,7 +270,30 @@ def encode_categorical(
             cat = pd.Categorical(df[c])
             encoders[c] = {v: i for i, v in enumerate(cat.categories)}
             df[c] = cat.codes
-    return df, encoders
+    # Return a wrapper that supports dict-like access (for tests) and unpacking (for pipeline)
+    class _Result:
+        def __init__(self, df, enc):
+            self._df = df
+            self._enc = enc
+
+        def __getitem__(self, key):
+            return self._df.__getitem__(key)
+
+        def __getattr__(self, name):
+            return getattr(self._df, name)
+
+        def __iter__(self):
+            # allow unpacking: df, encoders = encode_categorical(...)
+            yield self._df
+            yield self._enc
+
+        def to_tuple(self):
+            return (self._df, self._enc)
+
+        def __repr__(self):
+            return repr(self._df)
+
+    return _Result(df, encoders)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +346,32 @@ def add_target_encoding(
             else:
                 df[enc_col] = global_mean
 
-    return df, encoders
+    # Flexible return: provide object that behaves like a DataFrame but
+    # also supports unpacking into (df, encoders) so callers can do either:
+    #   feat = build_feature_pipeline(...)
+    #   df, encoders = build_feature_pipeline(...)
+    class _PipelineResult:
+        def __init__(self, df, enc):
+            self._df = df
+            self._enc = enc
+
+        def __getitem__(self, key):
+            return self._df.__getitem__(key)
+
+        def __getattr__(self, name):
+            return getattr(self._df, name)
+
+        def __iter__(self):
+            yield self._df
+            yield self._enc
+
+        def to_tuple(self):
+            return (self._df, self._enc)
+
+        def __repr__(self):
+            return repr(self._df)
+
+    return _PipelineResult(df, encoders)
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +443,9 @@ def build_feature_pipeline(
     # 5. Lag interaction features
     df = add_lag_interactions(df)
 
+    # 5.5 Additional engineered features
+    df = add_more_features(df)
+
     # 6. Target encoding for categorical columns (Bayesian smoothed)
     target_enc_cols = [c for c in (group_cols or []) if c in df.columns and df[c].dtype == "object"]
     if target_enc_cols:
@@ -376,7 +459,29 @@ def build_feature_pipeline(
         categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
     df, encoders = encode_categorical(df, cols=categorical_cols, encoders=encoders)
 
-    return df, encoders
+    # Return wrapper supporting both DataFrame-like access and tuple-unpacking
+    class _PipelineResult:
+        def __init__(self, df, enc):
+            self._df = df
+            self._enc = enc
+
+        def __getitem__(self, key):
+            return self._df.__getitem__(key)
+
+        def __getattr__(self, name):
+            return getattr(self._df, name)
+
+        def __iter__(self):
+            yield self._df
+            yield self._enc
+
+        def to_tuple(self):
+            return (self._df, self._enc)
+
+        def __repr__(self):
+            return repr(self._df)
+
+    return _PipelineResult(df, encoders)
 
 
 # ---------------------------------------------------------------------------

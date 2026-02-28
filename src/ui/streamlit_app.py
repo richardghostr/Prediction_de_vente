@@ -537,6 +537,20 @@ with st.sidebar:
     else:
         st.info("Module de prediction non disponible")
 
+    # Backend selection for offline prediction and native model toggle
+    model_backend = st.selectbox(
+        "Backend modele (hors-ligne)",
+        options=["Auto", "XGBoost", "Prophet", "LightGBM"],
+        index=0,
+        key="sidebar_model_backend",
+    )
+
+    allow_native_models = st.checkbox(
+        "Autoriser modèles natifs (XGBoost/LightGBM) — peut échouer sur certains systèmes",
+        value=False,
+        key="sidebar_allow_native",
+    )
+
     st.divider()
     st.markdown(
         "<div style='text-align:center; color: rgba(255,255,255,0.4); font-size:0.75rem;'>"
@@ -1433,11 +1447,22 @@ with tab_predict:
                     except Exception:
                         local_predict = None
 
-                if local_predict is not None:
+                if local_predict is not None and allow_native_models:
                     try:
                         forecast_result = local_predict(series_payload, horizon=horizon)
                     except Exception as e:
-                        st.warning(f"Modele local echoue : {e}. Utilisation du repli naive.")
+                        msg = str(e)
+                        # Hide verbose native runtime errors (libgomp) from the UI
+                        if "libgomp" in msg or "libgomp.so.1" in msg:
+                            st.warning(
+                                "Modèle natif indisponible sur ce système (runtime manquant). "
+                                "Désactivez 'Autoriser modèles natifs' dans la barre latérale pour éviter cette tentative."
+                            )
+                        else:
+                            st.warning(f"Modele local echoue : {e}. Utilisation du repli naive.")
+                elif local_predict is not None and not allow_native_models:
+                    # User explicitly disabled native models; do not attempt local_predict
+                    st.info("Tentative de modèles natifs désactivée (barre latérale). Utilisation du repli naive.")
 
                 # Naive fallback
                 if forecast_result is None:

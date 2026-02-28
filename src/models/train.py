@@ -333,14 +333,21 @@ def tune_xgb(
 def _default_lgbm_params() -> dict:
     return {
         "n_estimators": 1000,
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "num_leaves": 63,
-        "min_child_samples": 20,
+        # Limit complexity to reduce overfitting
+        "max_depth": 8,
+        "learning_rate": 0.03,
+        # num_leaves tuned smaller to reduce variance
+        "num_leaves": 24,
+        # stronger min child samples to avoid tiny leaves
+        "min_child_samples": 30,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        # regularization
         "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
+        "reg_lambda": 0.1,
         "random_state": 42,
         "verbosity": -1,
         "n_jobs": -1,
@@ -621,6 +628,15 @@ def main(argv=None) -> int:
     parser.add_argument("--horizon", type=int, default=60, help="Test horizon in unique dates (default: 60)")
     parser.add_argument("--tune", action="store_true", help="Run Optuna hyperparameter tuning")
     parser.add_argument("--n-trials", type=int, default=50, help="Number of Optuna trials (default: 50)")
+    parser.add_argument("--cv", action="store_true", help="Run time-series CV and save results, then exit")
+    parser.add_argument("--n-estimators", type=int, default=None, help="Override number of estimators (for quick runs)")
+    parser.add_argument("--max-depth", type=int, default=None, help="Override max depth")
+    parser.add_argument("--learning-rate", type=float, default=None, help="Override learning rate")
+    parser.add_argument("--reg-alpha", type=float, default=None, help="Override reg_alpha")
+    parser.add_argument("--reg-lambda", type=float, default=None, help="Override reg_lambda")
+    parser.add_argument("--subsample", type=float, default=None, help="Override subsample")
+    parser.add_argument("--colsample-bytree", type=float, default=None, help="Override colsample_bytree")
+    parser.add_argument("--min-child-weight", type=float, default=None, help="Override min_child_weight / min_child_samples")
     parser.add_argument("--tag", default="baseline")
     parser.add_argument("--ensemble", action="store_true", help="Train LightGBM + XGBoost ensemble")
     args = parser.parse_args(argv)
@@ -701,9 +717,101 @@ def main(argv=None) -> int:
         lgbm_params = _default_lgbm_params() if use_lgbm else None
         xgb_params = _default_xgb_params()
 
+    # If user requested a CV-only run, execute and exit (use full X_all)
+    if args.cv:
+        METRICS_PATH.mkdir(parents=True, exist_ok=True)
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            if use_lgbm:
+                from lightgbm import LGBMRegressor
+                model_class = LGBMRegressor
+                params = lgbm_params
+                model_name = "LightGBM"
+            else:
+                from xgboost import XGBRegressor
+                model_class = XGBRegressor
+                params = xgb_params
+                model_name = "XGBoost"
+
+            mean_mae, std_mae = time_series_cv_score(model_class, params, X_all, y_all, n_splits=5, early_stopping=True)
+            out = {
+                "model": model_name,
+                "cv_mean_mae": mean_mae,
+                "cv_std_mae": std_mae,
+            }
+            out_path = METRICS_PATH / f"cv_results_{ts}.json"
+            with open(out_path, "w") as fh:
+                json.dump(out, fh, indent=2)
+            logger.info("[train] CV results saved to %s", out_path)
+            print(f"[train] CV results saved to {out_path}")
+            return 0
+        except Exception as e:
+            logger.error("[train] CV run failed: %s", e)
+            import traceback; traceback.print_exc()
+            return 1
+
+    # Allow CLI overrides of key hyperparameters for quick experiments
+    try:
+        if lgbm_params is not None:
+            if args.n_estimators is not None:
+                lgbm_params["n_estimators"] = args.n_estimators
+            if args.max_depth is not None:
+                lgbm_params["max_depth"] = args.max_depth
+            if args.learning_rate is not None:
+                lgbm_params["learning_rate"] = args.learning_rate
+            if args.reg_alpha is not None:
+                lgbm_params["reg_alpha"] = args.reg_alpha
+            if args.reg_lambda is not None:
+                lgbm_params["reg_lambda"] = args.reg_lambda
+            if args.subsample is not None:
+                lgbm_params["subsample"] = args.subsample
+            if args.colsample_bytree is not None:
+                lgbm_params["colsample_bytree"] = args.colsample_bytree
+            if args.min_child_weight is not None:
+                lgbm_params["min_child_samples"] = int(args.min_child_weight)
+
+        if xgb_params is not None:
+            if args.n_estimators is not None:
+                xgb_params["n_estimators"] = args.n_estimators
+            if args.max_depth is not None:
+                xgb_params["max_depth"] = args.max_depth
+            if args.learning_rate is not None:
+                xgb_params["learning_rate"] = args.learning_rate
+            if args.reg_alpha is not None:
+                xgb_params["reg_alpha"] = args.reg_alpha
+            if args.reg_lambda is not None:
+                xgb_params["reg_lambda"] = args.reg_lambda
+            if args.subsample is not None:
+                xgb_params["subsample"] = args.subsample
+            if args.colsample_bytree is not None:
+                xgb_params["colsample_bytree"] = args.colsample_bytree
+            if args.min_child_weight is not None:
+                xgb_params["min_child_weight"] = args.min_child_weight
+    except Exception:
+        logger.debug("[train] Failed to apply CLI hyperparameter overrides", exc_info=True)
+
     # Train model(s)
     models = []
     model_names = []
+
+    # Ensure feature matrices contain only numeric dtypes for tree libraries
+    def _coerce_object_columns(df_in: pd.DataFrame) -> pd.DataFrame:
+        df_out = df_in.copy()
+        for c in df_out.columns:
+            if pd.api.types.is_object_dtype(df_out[c].dtype) or pd.api.types.is_categorical_dtype(df_out[c].dtype):
+                try:
+                    df_out[c] = pd.Categorical(df_out[c]).codes
+                except Exception:
+                    # fallback: convert to numeric where possible, else fill with 0
+                    df_out[c] = pd.to_numeric(df_out[c], errors="coerce").fillna(0).astype(float)
+        return df_out
+
+    X_tr = _coerce_object_columns(X_tr)
+    X_val = _coerce_object_columns(X_val)
+    X_test = _coerce_object_columns(X_test)
+    X_all = _coerce_object_columns(X_all)
+    X_train = _coerce_object_columns(X_train)
 
     if use_lgbm:
         logger.info("[train] Training LightGBM...")

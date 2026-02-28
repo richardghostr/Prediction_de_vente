@@ -26,6 +26,7 @@ from src.serve.schemas import (
 )
 from src import config
 from src.utils.logging import get_logger
+import os
 
 logger = get_logger("serve.api")
 
@@ -56,6 +57,10 @@ try:
 except Exception as e:
     logger.warning("Could not import predict module: %s", e)
     PREDICT_MODULE = None
+
+# Control whether the server should attempt to load/run native model binaries
+# Set environment variable `ALLOW_NATIVE_MODELS=true` to enable attempts (default: false)
+ALLOW_NATIVE_MODELS = os.environ.get("ALLOW_NATIVE_MODELS", "false").lower() in ("1", "true", "yes")
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +117,8 @@ def _predict_single(request: SeriesRequest, horizon: int) -> ForecastResponse:
     model_info = None
 
     # Try the trained model first
-    if PREDICT_MODULE and hasattr(PREDICT_MODULE, "predict_series"):
+    # Only attempt to use the predict module if present and native models are allowed.
+    if PREDICT_MODULE and hasattr(PREDICT_MODULE, "predict_series") and ALLOW_NATIVE_MODELS:
         try:
             result = PREDICT_MODULE.predict_series(series_payload, horizon=horizon)
             # Gather model info (include method and warning from predict_series)
@@ -128,8 +134,16 @@ def _predict_single(request: SeriesRequest, horizon: int) -> ForecastResponse:
         except FileNotFoundError as e:
             logger.warning("Model artifact not found, falling back to naive: %s", e)
         except Exception as e:
-            logger.exception("Error in predict module")
-            raise HTTPException(status_code=500, detail=f"Model prediction error: {e}")
+            # If the failure looks like a native runtime (libgomp) issue, log and fallback to naive
+            msg = str(e)
+            if "libgomp" in msg or "libgomp.so.1" in msg:
+                logger.warning("Native runtime error when calling predict module: %s", msg)
+            else:
+                logger.exception("Error in predict module")
+                raise HTTPException(status_code=500, detail=f"Model prediction error: {e}")
+    else:
+        if PREDICT_MODULE and hasattr(PREDICT_MODULE, "predict_series") and not ALLOW_NATIVE_MODELS:
+            logger.info("Skipping native model inference because ALLOW_NATIVE_MODELS is false")
 
     # Fallback to naive forecast
     if result is None:

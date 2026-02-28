@@ -118,13 +118,43 @@ def build_series_from_df(
 def run_offline_prediction(
     series: List[Dict[str, Any]],
     horizon: int,
+    model_choice: Optional[str] = None,
+    allow_local_models: bool = True,
 ) -> Dict[str, Any]:
-    """Run prediction using the local model or naive fallback."""
-    if predict_series is not None:
+    """Run prediction using the local model or naive fallback.
+
+    model_choice: optional hint from the UI; supported values: 'Auto'|'XGBoost'|'Prophet'|'LightGBM'
+    """
+    # If user requested a specific backend, attempt to honor it. Supported: 'Prophet', 'XGBoost', 'LightGBM', 'Auto'
+    # Prefer direct Prophet usage when requested and available.
+    if model_choice == "Prophet":
+        if get_model is not None:
+            try:
+                model = get_model()
+                # Prophet model objects are typically named 'Prophet'
+                if model is not None and "Prophet" in type(model).__name__:
+                    try:
+                        return _predict_with_prophet(model, series, horizon)
+                    except Exception as e:
+                        st.warning(f"Erreur lors de la prediction Prophet ({e}), repli vers predict_series.")
+            except Exception:
+                pass
+
+    # If local native models are disabled by the UI, skip calling predict_series entirely.
+    if allow_local_models and predict_series is not None:
         try:
+            # let predict_series handle XGBoost/LightGBM/ensemble logic
             return predict_series(series, horizon=horizon)
         except Exception as e:
-            st.warning(f"Modele local indisponible ({e}), repli vers la prediction naive.")
+            # If the failure is due to missing native runtime (eg. libgomp), show a concise message
+            msg = str(e)
+            if "libgomp" in msg or "libgomp.so.1" in msg:
+                st.warning(
+                    "Modèle natif indisponible sur ce système (erreur libgomp). "
+                    "Vous pouvez désactiver les modèles natifs dans l'UI pour éviter cette tentative."
+                )
+            else:
+                st.warning(f"Modele local indisponible ({e}), repli vers la prediction naive.")
 
     last_val = None
     last_date = None
@@ -143,6 +173,41 @@ def run_offline_prediction(
         forecast.append({"ds": ds, "yhat": float(last_val)})
 
     return {"id": None, "forecast": forecast, "metrics": {"method": "naive_last_value"}}
+
+
+def _predict_with_prophet(model, series: List[Dict[str, Any]], horizon: int) -> Dict[str, Any]:
+    """Attempt to produce a Prophet-style forecast from a loaded Prophet model.
+
+    This helper is tolerant: if it fails it will raise and caller will fallback.
+    """
+    df = pd.DataFrame(series)
+    if df.empty:
+        raise ValueError("Empty series for Prophet")
+    if "date" not in df.columns:
+        raise ValueError("`date` key required in series items")
+    df["ds"] = pd.to_datetime(df["date"]).dt.floor("D")
+    if "value" not in df.columns:
+        df["value"] = pd.NA
+
+    prop_df = df[["ds", "value"]].rename(columns={"value": "y"})
+    prop_df = prop_df.groupby("ds", as_index=False).agg({"y": "mean"})
+    prop_df = prop_df.set_index("ds").asfreq("D").interpolate(method="linear").reset_index()
+
+    last_date = prop_df["ds"].max()
+    future = pd.DataFrame({"ds": pd.date_range(start=last_date + pd.Timedelta(days=1), periods=horizon, freq="D")})
+
+    preds = model.predict(future)
+    if isinstance(preds, (list, tuple)):
+        # unexpected shape
+        raise ValueError("Prophet predict returned unexpected type")
+    if "yhat" not in preds.columns:
+        raise ValueError("Prophet predict result missing 'yhat' column")
+
+    forecast = []
+    for ds, yhat in zip(preds["ds"], preds["yhat"]):
+        forecast.append({"ds": pd.to_datetime(ds).strftime("%Y-%m-%d"), "yhat": float(yhat)})
+
+    return {"id": None, "forecast": forecast, "metrics": {"method": "prophet"}}
 
 
 def run_api_prediction(
@@ -518,6 +583,20 @@ def render_predict_ui() -> None:
         except Exception:
             st.warning("Impossible de verifier le statut du modele.")
 
+    # Backend selection for offline prediction
+    model_backend = st.selectbox(
+        "Backend modele (hors-ligne)",
+        options=["Auto", "XGBoost", "Prophet", "LightGBM"],
+        index=0,
+        key="predict_model_backend",
+    )
+
+    allow_native = st.checkbox(
+        "Autoriser modèles natifs (XGBoost/LightGBM) — peut échouer sur certains systèmes",
+        value=False,
+        key="predict_allow_native",
+    )
+
     # ID column detection
     id_col = None
     for c in df.columns:
@@ -565,7 +644,9 @@ def render_predict_ui() -> None:
 
                 # Run prediction
                 if mode == "Hors-ligne":
-                    result = run_offline_prediction(series, horizon=horizon)
+                    result = run_offline_prediction(
+                        series, horizon=horizon, model_choice=model_backend, allow_local_models=allow_native
+                    )
                 else:
                     result = run_api_prediction(
                         series, horizon=horizon,

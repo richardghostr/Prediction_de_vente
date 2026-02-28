@@ -324,6 +324,45 @@ def evaluate(
         "overfit_ratio": float(overfit_ratio),
     }
 
+    # Error analysis by segment (store, dayofweek, month) when possible
+    try:
+        test_df = df.loc[test_mask].copy()
+        # Align predictions
+        test_df = test_df.reset_index(drop=True)
+        preds = list(y_pred_test)
+        # Ensure same length
+        if len(preds) == len(test_df):
+            test_df["y_pred"] = preds
+            test_df["error"] = test_df["y_pred"] - test_df["value"]
+            test_df["abs_error"] = test_df["error"].abs()
+
+            ea = {}
+            if "store_id" in test_df.columns:
+                by_store = test_df.groupby("store_id")["abs_error"].mean().sort_values().to_dict()
+                ea["by_store_mae"] = by_store
+            if "dayofweek" in test_df.columns:
+                by_dow = test_df.groupby("dayofweek")["abs_error"].mean().sort_index().to_dict()
+                ea["by_dayofweek_mae"] = by_dow
+            else:
+                # derive from date if available
+                if "date" in test_df.columns:
+                    test_df["_dow"] = pd.to_datetime(test_df["date"]).dt.dayofweek
+                    by_dow = test_df.groupby("_dow")["abs_error"].mean().sort_index().to_dict()
+                    ea["by_dayofweek_mae"] = by_dow
+
+            if "month" in test_df.columns:
+                by_month = test_df.groupby("month")["abs_error"].mean().sort_index().to_dict()
+                ea["by_month_mae"] = by_month
+            else:
+                if "date" in test_df.columns:
+                    test_df["_month"] = pd.to_datetime(test_df["date"]).dt.month
+                    by_month = test_df.groupby("_month")["abs_error"].mean().sort_index().to_dict()
+                    ea["by_month_mae"] = by_month
+
+            results["error_analysis"] = ea
+    except Exception:
+        logger.debug("[evaluate] Error analysis failed", exc_info=True)
+
     _print_interpretation(results)
     return results
 
