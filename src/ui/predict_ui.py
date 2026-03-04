@@ -597,6 +597,10 @@ def render_predict_ui() -> None:
         key="predict_allow_native",
     )
 
+    debug_show = st.checkbox(
+        "Afficher diagnostics bruts (raw preds)", value=False, key="predict_debug_raw"
+    )
+
     # ID column detection
     id_col = None
     for c in df.columns:
@@ -656,6 +660,14 @@ def render_predict_ui() -> None:
 
                 st.success("Prediction terminee !")
                 display_forecast_results(result, hist_df=hist_df)
+
+                if debug_show:
+                    try:
+                        st.divider()
+                        st.subheader("Diagnostics bruts")
+                        st.json(result.get("model_info", {}))
+                    except Exception:
+                        pass
 
             except Exception as e:
                 st.error(f"Erreur : {e}")

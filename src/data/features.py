@@ -492,6 +492,9 @@ def build_feature_pipeline(
 
         def __repr__(self):
             return repr(self._df)
+        
+        def __len__(self):
+            return len(self._df)
 
     return _PipelineResult(df, encoders)
 

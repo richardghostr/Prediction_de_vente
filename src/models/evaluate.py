@@ -342,8 +342,12 @@ def evaluate(
     y_pred_train = model.predict(X_train)
     y_pred_test = model.predict(X_test)
 
-    # If model was trained on log1p(target), invert predictions for metric calculation
-    if model_config and model_config.get("target_log"):
+    # If model was trained with a target transform (log1p) invert predictions for metric calculation
+    target_transform = None
+    if model_config:
+        target_transform = model_config.get("target_transform") or ("log1p" if model_config.get("target_log") else None)
+
+    if target_transform == "log1p":
         try:
             y_pred_train = np.expm1(y_pred_train)
             y_pred_test = np.expm1(y_pred_test)

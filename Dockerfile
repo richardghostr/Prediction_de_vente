@@ -4,7 +4,11 @@ WORKDIR /app
 
 # Install system deps (if needed) and pip dependencies
 COPY requirements.txt ./
-RUN python -m pip install --upgrade pip && \
+RUN set -eux; \
+    python -m pip install --upgrade pip; \
+    apt-get update -y; \
+    apt-get install -y --no-install-recommends libgomp1 ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy project

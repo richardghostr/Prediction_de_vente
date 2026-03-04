@@ -191,6 +191,9 @@ def predict_series(
 
     encoders = config.get("encoders")
     bias_correction = float(config.get("bias_correction", 0.0))
+    target_transform = config.get("target_transform")
+    bias_space = config.get("bias_space", "original")
+    prediction_floor = float(config.get("prediction_floor", 0.0))
 
     try:
         from src.data.features import build_feature_pipeline
@@ -238,6 +241,7 @@ def predict_series(
 
     history = df.copy()
     forecast = []
+    used_last_val = False
 
     for step in range(1, horizon + 1):
         try:
@@ -257,26 +261,80 @@ def predict_series(
 
         if feats is None or feats.dropna().empty:
             yhat = float(last_val)
+            used_last_val = True
         else:
             exclude = set(FEATURE_EXCLUDE) | {"value", "date"}
             X = feats.drop(columns=[c for c in feats.columns if c in exclude], errors="ignore")
             X_clean = X.dropna()
             if X_clean.empty:
                 yhat = float(last_val)
+                used_last_val = True
             else:
                 X_last = X_clean.iloc[[-1]]
                 X_last = _align_features_to_model(X_last, model)
                 raw = float(model.predict(X_last)[0])
-                raw_corrected = raw + bias_correction
+
+                # Compute corrected prediction taking possible target transforms into account.
+                pred_orig = None
+                raw_corrected = None
+                try:
+                    if target_transform == "log1p":
+                        # If bias is stored in transformed space, add it before inverse transform.
+                        if bias_space == "transformed":
+                            raw_biased = raw + bias_correction
+                            try:
+                                pred_orig = math.expm1(raw_biased)
+                            except Exception:
+                                pred_orig = float(last_val)
+                            raw_corrected = pred_orig
+                        else:
+                            # bias in original space: inverse then add bias
+                            try:
+                                pred_orig = math.expm1(raw)
+                            except Exception:
+                                pred_orig = float(last_val)
+                            raw_corrected = pred_orig + bias_correction
+                    else:
+                        # No target transform: bias is applied directly to model raw output
+                        raw_corrected = raw + bias_correction
+                except Exception:
+                    raw_corrected = float(last_val)
+
                 yhat = raw_corrected if math.isfinite(raw_corrected) else float(last_val)
 
-        yhat = max(0.0, yhat)
+        # Replace hard silent clipping with configurable floor and logging.
         if not math.isfinite(yhat):
             yhat = float(last_val)
+            used_last_val = True
+
+        if prediction_floor > 0.0:
+            if yhat < prediction_floor:
+                print(f"[predict] yhat below floor ({yhat:.6f}) -> setting to floor {prediction_floor}")
+                yhat = prediction_floor
+        else:
+            if yhat < 0.0:
+                # preserve previous behavior but log the event for visibility
+                print(f"[predict] yhat < 0 ({yhat:.6f}) -> clipping to 0.0 (raw={raw if 'raw' in locals() else 'NA'}, corrected={raw_corrected if 'raw_corrected' in locals() else 'NA'})")
+                yhat = 0.0
 
         last_date = history["date"].iloc[-1]
         next_date = last_date + pd.Timedelta(days=1)
-        forecast.append({"ds": next_date.strftime("%Y-%m-%d"), "yhat": round(yhat, 2)})
+        # Include raw diagnostics in the per-day forecast dict to help debugging/inspection.
+        fc_item = {"ds": next_date.strftime("%Y-%m-%d"), "yhat": round(yhat, 2)}
+        try:
+            fc_item["raw_model"] = round(raw, 6)
+        except Exception:
+            pass
+        if pred_orig is not None:
+            try:
+                fc_item["pred_orig"] = round(float(pred_orig), 6)
+            except Exception:
+                pass
+        try:
+            fc_item["corrected"] = round(float(raw_corrected), 6)
+        except Exception:
+            pass
+        forecast.append(fc_item)
 
         new_row = {"date": next_date, "value": yhat}
         for col in group_cols:
@@ -289,13 +347,23 @@ def predict_series(
 
         history = pd.concat([history, pd.DataFrame([new_row])], ignore_index=True)
 
+    final_warning = warning
+    if used_last_val:
+        msg = "Some steps used the last observed value due to missing features."
+        if final_warning:
+            final_warning = final_warning + " " + msg
+        else:
+            final_warning = msg
+
     return {
         "id": None,
         "forecast": forecast,
         "method": "xgboost" if not hasattr(model, "models") else "ensemble",
-        "warning": warning,
+        "warning": final_warning,
         "min_history_required": min_history,
         "actual_history": n_history,
+        "model_info": {"target_transform": target_transform, "bias_space": bias_space, "bias_correction": bias_correction},
+        "used_last_val": used_last_val,
     }
 
 

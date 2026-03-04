@@ -676,10 +676,14 @@ def save_artifacts(
         config["encoders"] = serializable_enc
     if metrics.get("feature_names"):
         config["feature_names"] = metrics["feature_names"]
-    if "Bias_train" in metrics:
+    # Save bias correction (negative of test bias so adding it corrects predictions)
+    if "Bias_test" in metrics:
         config["bias_correction"] = -metrics["Bias_test"]
+        # bias was computed on the original target scale in evaluate_model
+        config["bias_space"] = "original"
+    # Record target transform used during training in a clear way
     if target_log:
-        config["target_log"] = True
+        config["target_transform"] = "log1p"
     if training_features_path is not None:
         config["training_features_path"] = str(training_features_path)
 
