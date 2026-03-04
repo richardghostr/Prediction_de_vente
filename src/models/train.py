@@ -74,6 +74,14 @@ def load_and_prepare(
     logger.info("[train] Loading raw data from %s", path)
     df = pd.read_csv(path, parse_dates=["date"])
 
+    # Basic cleaning: sanitize obvious quantity/value corruption before feature engineering
+    try:
+        from src.data.clean import clean_dataframe
+        df = clean_dataframe(df, date_col="date", value_col="value", fill_strategy="ffill", outlier_threshold=None)
+        logger.info("[train] Applied clean_dataframe sanitization (quantity/value fixes)")
+    except Exception:
+        logger.debug("[train] clean_dataframe not available or failed, continuing without extra sanitization", exc_info=True)
+
     # Remove pre-computed short-horizon columns already stored in the CSV
     short_col_re = re.compile(
         r"^(?:lag|roll_mean|roll_std|roll_min|roll_max|roll_range|roll_cv|ewma|lag_diff|lag_ratio)_(\d+)"
@@ -468,41 +476,69 @@ def evaluate_model(
     X_all: pd.DataFrame,
     y_all: pd.Series,
     n_cv_splits: int = 5,
+    target_log: bool = False,
+    y_train_orig: pd.Series = None,
+    y_test_orig: pd.Series = None,
+    y_all_orig: pd.Series = None,
 ) -> dict:
     """Evaluate with train/test/CV metrics."""
-    # Train metrics
-    y_pred_train = model.predict(X_train)
-    mae_train = mean_absolute_error(y_train, y_pred_train)
-    rmse_train = sqrt(mean_squared_error(y_train, y_pred_train))
-    r2_train = r2_score(y_train, y_pred_train)
-    bias_train = float(np.mean(y_pred_train - y_train))
+    # If model was trained on log-target, we expect y_* to be log1p transformed
+    # and need to inverse-transform predictions before reporting metrics on
+    # the original scale.
+    if target_log:
+        # originals must be provided
+        if y_train_orig is None or y_test_orig is None or y_all_orig is None:
+            raise ValueError("evaluate_model: original targets required when target_log=True")
+
+        # Predict on log-scale then invert
+        y_pred_train_log = model.predict(X_train)
+        y_pred_train = np.expm1(y_pred_train_log)
+        y_true_train = y_train_orig
+
+        y_pred_test_log = model.predict(X_test)
+        y_pred_test = np.expm1(y_pred_test_log)
+        y_true_test = y_test_orig
+    else:
+        y_pred_train = model.predict(X_train)
+        y_true_train = y_train
+        y_pred_test = model.predict(X_test)
+        y_true_test = y_test
+
+    mae_train = mean_absolute_error(y_true_train, y_pred_train)
+    rmse_train = sqrt(mean_squared_error(y_true_train, y_pred_train))
+    r2_train = r2_score(y_true_train, y_pred_train)
+    bias_train = float(np.mean(y_pred_train - y_true_train))
 
     # Test metrics
-    y_pred_test = model.predict(X_test)
-    mae_test = mean_absolute_error(y_test, y_pred_test)
-    rmse_test = sqrt(mean_squared_error(y_test, y_pred_test))
-    r2_test = r2_score(y_test, y_pred_test)
-    bias_test = float(np.mean(y_pred_test - y_test))
+    # y_pred_test and y_true_test already computed above for log-case
+    mae_test = mean_absolute_error(y_true_test, y_pred_test)
+    rmse_test = sqrt(mean_squared_error(y_true_test, y_pred_test))
+    r2_test = r2_score(y_true_test, y_pred_test)
+    bias_test = float(np.mean(y_pred_test - y_true_test))
 
     # Bias-corrected test metrics
     y_pred_test_corrected = y_pred_test - bias_test
-    mae_test_corrected = mean_absolute_error(y_test, y_pred_test_corrected)
-    rmse_test_corrected = sqrt(mean_squared_error(y_test, y_pred_test_corrected))
-    r2_test_corrected = r2_score(y_test, y_pred_test_corrected)
+    mae_test_corrected = mean_absolute_error(y_true_test, y_pred_test_corrected)
+    rmse_test_corrected = sqrt(mean_squared_error(y_true_test, y_pred_test_corrected))
+    r2_test_corrected = r2_score(y_true_test, y_pred_test_corrected)
 
     # Safe MAPE (exclude near-zero actuals)
-    mask = np.abs(y_test.values) > 1.0
+    mask = np.abs(y_true_test.values) > 1.0
     if mask.sum() > 0:
-        mape_test = float(np.mean(np.abs((y_test.values[mask] - y_pred_test[mask]) / y_test.values[mask])) * 100)
+        mape_test = float(np.mean(np.abs((y_true_test.values[mask] - y_pred_test[mask]) / y_true_test.values[mask])) * 100)
     else:
         mape_test = None
 
     # sMAPE
-    denom = (np.abs(y_test.values) + np.abs(y_pred_test)) / 2
+    denom = (np.abs(y_true_test.values) + np.abs(y_pred_test)) / 2
     denom_safe = np.where(denom > 0, denom, 1.0)
-    smape_test = float(np.mean(np.abs(y_test.values - y_pred_test) / denom_safe) * 100)
+    smape_test = float(np.mean(np.abs(y_true_test.values - y_pred_test) / denom_safe) * 100)
 
     # Cross-validation on full dataset
+    # For CV we operate on the provided X_all/y_all. If target_log is True,
+    # y_all is expected to be the log-transformed target (so CV models train on
+    # transformed targets); final CV metrics will be inverse-transformed where
+    # needed (we compute fold predictions then invert before scoring).
     tscv = TimeSeriesSplit(n_splits=min(n_cv_splits, max(2, len(X_all) // 100)))
     cv_scores = {"mae": [], "rmse": [], "r2": []}
 
@@ -533,9 +569,19 @@ def evaluate_model(
             model_cv.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
 
         y_val_pred = model_cv.predict(X_val)
-        cv_scores["mae"].append(float(mean_absolute_error(y_val, y_val_pred)))
-        cv_scores["rmse"].append(float(sqrt(mean_squared_error(y_val, y_val_pred))))
-        cv_scores["r2"].append(float(r2_score(y_val, y_val_pred)))
+        if target_log:
+            # invert predictions and compare with original y (y_all_orig slice)
+            y_val_pred_inv = np.expm1(y_val_pred)
+            # corresponding true values in original scale
+            start, end = val_idx[0], val_idx[-1] + 1
+            y_val_true_orig = y_all_orig.iloc[start:end]
+            cv_scores["mae"].append(float(mean_absolute_error(y_val_true_orig, y_val_pred_inv)))
+            cv_scores["rmse"].append(float(sqrt(mean_squared_error(y_val_true_orig, y_val_pred_inv))))
+            cv_scores["r2"].append(float(r2_score(y_val_true_orig, y_val_pred_inv)))
+        else:
+            cv_scores["mae"].append(float(mean_absolute_error(y_val, y_val_pred)))
+            cv_scores["rmse"].append(float(sqrt(mean_squared_error(y_val, y_val_pred))))
+            cv_scores["r2"].append(float(r2_score(y_val, y_val_pred)))
 
     overfit_ratio = rmse_test / rmse_train if rmse_train > 0 else float("inf")
 
@@ -600,6 +646,7 @@ def save_artifacts(
     windows: Optional[List[int]] = None,
     training_features_path: Optional[str] = None,
     feature_importance: Optional[pd.DataFrame] = None,
+    target_log: bool = False,
 ) -> Tuple[Path, Path]:
     """Persist model, metrics, encoders, and feature config to disk."""
     ARTIFACTS_PATH.mkdir(parents=True, exist_ok=True)
@@ -631,12 +678,36 @@ def save_artifacts(
         config["feature_names"] = metrics["feature_names"]
     if "Bias_train" in metrics:
         config["bias_correction"] = -metrics["Bias_test"]
+    if target_log:
+        config["target_log"] = True
     if training_features_path is not None:
         config["training_features_path"] = str(training_features_path)
 
     config_file = model_file.parent / (model_file.stem + "_config.json")
     with open(config_file, "w") as f:
         json.dump(config, f, indent=2)
+
+    # Also write encoders separately for easier inspection and reuse
+    try:
+        enc_file = model_file.parent / f"encoders_{today}.json"
+        def _make_jsonable(obj):
+            if isinstance(obj, dict):
+                out = {}
+                for k, v in obj.items():
+                    key = str(k)
+                    out[key] = _make_jsonable(v)
+                return out
+            if isinstance(obj, (list, tuple)):
+                return [_make_jsonable(x) for x in obj]
+            # basic types
+            return obj
+
+        if encoders:
+            with open(enc_file, "w") as fe:
+                json.dump(_make_jsonable(encoders), fe, indent=2)
+            logger.info("[train] Encoders saved: %s", enc_file)
+    except Exception:
+        logger.debug("[train] Failed to write encoders file", exc_info=True)
 
     # Save feature importance
     if feature_importance is not None and not feature_importance.empty:
@@ -657,6 +728,7 @@ def main(argv=None) -> int:
     parser.add_argument("--windows", default=None, help=f"Comma-separated rolling window sizes (default: {PREDICT_WINDOWS})")
     parser.add_argument("--horizon", type=int, default=14, help="Forecast horizon in days (default: 14). Lags/features shorter than this are excluded from train and test.")
     parser.add_argument("--tune", action="store_true", help="Run Optuna hyperparameter tuning")
+    parser.add_argument("--log-target", action="store_true", help="Train on log1p(target) and report metrics on original scale")
     parser.add_argument("--n-trials", type=int, default=50, help="Number of Optuna trials (default: 50)")
     parser.add_argument("--cv", action="store_true", help="Run time-series CV and save results, then exit")
     parser.add_argument("--n-estimators", type=int, default=None, help="Override number of estimators (for quick runs)")
@@ -683,8 +755,8 @@ def main(argv=None) -> int:
         if fallback.exists():
             features_path = fallback
         else:
-            # Finally try any sample features
-            sample = PROJECT_ROOT / "data" / "processed" / "sample_features.csv"
+            # Finally try any train features
+            sample = PROJECT_ROOT / "data" / "processed" / "train_features.csv"
             if sample.exists():
                 features_path = sample
             else:
@@ -730,6 +802,8 @@ def main(argv=None) -> int:
     feature_cols = [c for c in df.columns if c not in exclude_cols]
     X_all = df[feature_cols].copy()
     y_all = df["value"].copy()
+    # Keep originals in case we apply target transform (log1p)
+    y_all_orig = y_all.copy()
 
     # Try LightGBM first, fallback to XGBoost
     use_lgbm = True
@@ -845,6 +919,20 @@ def main(argv=None) -> int:
     X_all = _coerce_object_columns(X_all)
     X_train = _coerce_object_columns(X_train)
 
+    # Optional target transform (log1p) to stabilize variance for heavy-tailed targets
+    if args.log_target:
+        logger.info("[train] Applying log1p transform to target for training")
+        # preserve originals
+        y_tr_orig = y_tr.copy()
+        y_val_orig = y_val.copy()
+        y_test_orig = y_test.copy()
+        y_all_orig = y_all.copy()
+
+        y_tr = np.log1p(y_tr)
+        y_val = np.log1p(y_val)
+        y_test = np.log1p(y_test)
+        y_all = np.log1p(y_all)
+
     if use_lgbm:
         logger.info("[train] Training LightGBM...")
         lgbm_model = train_lgbm(X_tr, y_tr, X_val, y_val, lgbm_params)
@@ -889,7 +977,13 @@ def main(argv=None) -> int:
         tag = args.tag
 
     # Evaluate
-    metrics = evaluate_model(model, X_train, y_train, X_test, y_test, X_all, y_all)
+    metrics = evaluate_model(
+        model, X_train, y_train, X_test, y_test, X_all, y_all,
+        target_log=args.log_target,
+        y_train_orig=(y_all_orig.loc[X_train.index] if args.log_target else None),
+        y_test_orig=(y_all_orig.loc[X_test.index] if args.log_target else None),
+        y_all_orig=(y_all_orig if args.log_target else None),
+    )
 
     # Feature importance
     fi = get_feature_importance(model, list(X_train.columns))
@@ -902,6 +996,7 @@ def main(argv=None) -> int:
     model_file, metrics_file = save_artifacts(
         model, metrics, encoders=encoders, tag=tag, lags=lags, windows=windows,
         training_features_path=str(features_path), feature_importance=fi,
+        target_log=bool(args.log_target),
     )
 
     # Print results

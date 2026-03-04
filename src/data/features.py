@@ -291,6 +291,9 @@ def encode_categorical(
             # allow unpacking: df, encoders = encode_categorical(...)
             yield self._df
             yield self._enc
+        
+        def __len__(self):
+            return len(self._df)
 
         def to_tuple(self):
             return (self._df, self._enc)
@@ -369,6 +372,9 @@ def add_target_encoding(
         def __iter__(self):
             yield self._df
             yield self._enc
+        
+        def __len__(self):
+            return len(self._df)
 
         def to_tuple(self):
             return (self._df, self._enc)

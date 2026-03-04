@@ -57,6 +57,15 @@ def _load_model_config(model_path: Path) -> Dict[str, Any]:
         with open(config_path) as f:
             return json.load(f)
     except Exception:
+        # fallback: try to load any encoders file in artifacts
+        try:
+            files = sorted(model_path.parent.glob("encoders_*.json"))
+            if files:
+                with open(files[-1]) as fe:
+                    enc = json.load(fe)
+                return {"encoders": enc}
+        except Exception:
+            pass
         return {}
 
 

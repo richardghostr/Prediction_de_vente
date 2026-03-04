@@ -16,13 +16,13 @@ def test_training_end_to_end(tmp_path: Path):
     End-to-end training test with a light model.
 
     This test:
-    - ensures sample_features.csv exists,
+    - ensures train_features.csv exists,
     - runs the training entrypoint with a small model (few trees),
     - checks that a model artifact and metrics file are created.
     """
     data_dir = PROJECT_ROOT / "data" / "processed"
-    sample_features = data_dir / "sample_features.csv"
-    assert sample_features.exists(), "sample_features.csv should exist in data/processed"
+    train_features = data_dir / "train_features.csv"
+    assert train_features.exists(), "train_features.csv should exist in data/processed"
 
     # Run training with lighter hyperparameters to keep the test fast
     argv = [

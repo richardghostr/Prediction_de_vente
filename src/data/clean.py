@@ -99,8 +99,40 @@ def clean_dataframe(
 
     df = fill_missing(df, strategy=fill_strategy, numeric_cols=[value_col] if value_col in df.columns else None)
 
+    # Remove simple value outliers based on z-score if requested
     if outlier_threshold is not None and outlier_threshold > 0 and value_col in df.columns:
         df = remove_outliers(df, col=value_col, threshold=outlier_threshold)
+
+    # Additional sanitization for quantity / value inconsistencies which often
+    # cause extreme targets (e.g. corrupted quantity values). We robustly cap
+    # per-product quantities using the 99th percentile and fallback to global
+    # thresholds. If `price` is available we recompute `value = price * quantity`
+    # after fixing quantities to ensure consistency.
+    if "quantity" in df.columns:
+        # Use a robust per-product median computed excluding extreme values.
+        ABS_QTY_CAP = 10000  # reasonable absolute upper bound for a single-day sale
+        try:
+            per_prod_med = df[df["quantity"] <= ABS_QTY_CAP].groupby("product_id")["quantity"].transform(lambda x: x.median())
+        except Exception:
+            per_prod_med = pd.Series(df["quantity"].where(df["quantity"] <= ABS_QTY_CAP).median(), index=df.index)
+
+        global_med = df["quantity"].where(df["quantity"] <= ABS_QTY_CAP).median()
+
+        # Rows with absurdly large quantities are replaced with per-product median or global median
+        bad_qty_mask = df["quantity"] > ABS_QTY_CAP
+        if bad_qty_mask.any():
+            df.loc[bad_qty_mask, "quantity"] = per_prod_med[bad_qty_mask].fillna(global_med)
+        # ensure no NaNs remain in quantity after replacement
+        df["quantity"] = df["quantity"].fillna(global_med)
+
+    # Recompute `value` if price & quantity available and value seems inconsistent
+    if "price" in df.columns and "quantity" in df.columns and value_col in df.columns:
+        # compute expected value and compare to actual; if differs strongly, overwrite
+        expected = df["price"] * df["quantity"]
+        # If actual value is either zero or more than 100x the expected, replace it
+        mismatch = (df[value_col].isna()) | (df[value_col] == 0) | (df[value_col] > expected * 100)
+        if mismatch.any():
+            df.loc[mismatch, value_col] = expected.loc[mismatch]
 
     return df.reset_index(drop=True)
 

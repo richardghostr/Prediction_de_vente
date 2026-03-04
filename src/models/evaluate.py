@@ -74,6 +74,15 @@ def _load_model_config(model_path: Path) -> Optional[Dict[str, Any]]:
     """Load lags/windows/encoders config saved alongside the model artifact."""
     config_path = model_path.parent / (model_path.stem + "_config.json")
     if not config_path.exists():
+        # fallback: try to load latest encoders_*.json if present
+        try:
+            files = sorted(model_path.parent.glob("encoders_*.json"))
+            if files:
+                with open(files[-1]) as fe:
+                    enc = json.load(fe)
+                return {"encoders": enc}
+        except Exception:
+            pass
         return None
     try:
         with open(config_path) as f:
@@ -228,6 +237,14 @@ def evaluate(
 
     df = pd.read_csv(features_source, parse_dates=["date"]) 
 
+    # Apply basic cleaning consistent with training
+    try:
+        from src.data.clean import clean_dataframe
+        df = clean_dataframe(df, date_col="date", value_col="value", fill_strategy="ffill", outlier_threshold=None)
+        logger.info("[evaluate] Applied clean_dataframe sanitization before feature engineering")
+    except Exception:
+        logger.debug("[evaluate] clean_dataframe not available or failed, continuing without extra sanitization", exc_info=True)
+
     # Detect group and categorical columns
     available_groups = [c for c in GROUP_COLS if c in df.columns]
     # Handle aliases
@@ -324,6 +341,19 @@ def evaluate(
     # 5. Predict and compute metrics
     y_pred_train = model.predict(X_train)
     y_pred_test = model.predict(X_test)
+
+    # If model was trained on log1p(target), invert predictions for metric calculation
+    if model_config and model_config.get("target_log"):
+        try:
+            y_pred_train = np.expm1(y_pred_train)
+            y_pred_test = np.expm1(y_pred_test)
+            logger.info("[evaluate] Inverted log-target predictions via expm1 for metrics")
+        except Exception:
+            logger.debug("[evaluate] Failed to invert log-target predictions", exc_info=True)
+
+    # Ensure true targets are numeric
+    y_train = pd.to_numeric(y_train, errors="coerce").fillna(0).astype(float)
+    y_test = pd.to_numeric(y_test, errors="coerce").fillna(0).astype(float)
 
     train_metrics = compute_metrics(y_train, y_pred_train)
     test_metrics = compute_metrics(y_test, y_pred_test)

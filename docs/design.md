@@ -80,7 +80,7 @@ Le projet **Prediction de Vente** implémente un pipeline de prévision de vente
    - Sortie : `data/processed/<stem>_features.csv`.
 
 4. **Entraînement** (`models/train.py`)
-   - Entrée : un CSV de features (généralement `uploaded_generated_training_10950_features.csv` ou `sample_features.csv`).
+  - Entrée : un CSV de features (généralement `uploaded_generated_training_10950_features.csv` ou `train_features.csv`).
    - Étapes :
      - normalisation des noms de colonnes (remap `id`→`store_id` si nécessaire),
      - application du pipeline de features group‑aware (cohérent avec `features.py`),

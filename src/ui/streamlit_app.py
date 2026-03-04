@@ -635,7 +635,7 @@ if uploaded is None and st.session_state["uploaded_file_data"] is None:
     st.markdown("<br>", unsafe_allow_html=True)
 
     # Show sample info
-    sample_path = PROJECT_ROOT / "sample.csv"
+    sample_path = PROJECT_ROOT / "data" / "interim" / "train.csv"
     if sample_path.exists():
         st.info(
             f"Un fichier d'exemple est disponible dans le projet : `{sample_path.name}` "

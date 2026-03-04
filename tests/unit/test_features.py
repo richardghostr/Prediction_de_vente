@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.data import clean, features
 
 
-def _make_sample_df():
+def _make_train_df():
     return pd.DataFrame(
         {
             "date": pd.date_range("2023-01-01", periods=10, freq="D"),
@@ -21,7 +21,7 @@ def _make_sample_df():
 
 
 def test_clean_and_time_features():
-    df = _make_sample_df()
+    df = _make_train_df()
     # use a slightly lower threshold to reliably remove the clear outlier in the sample
     cleaned = clean.clean_dataframe(df, date_col="date", value_col="value", fill_strategy="mean", outlier_threshold=2.0)
     assert "date" in cleaned.columns
@@ -31,7 +31,7 @@ def test_clean_and_time_features():
 
 
 def test_lags_and_rolling():
-    df = _make_sample_df()
+    df = _make_train_df()
     cleaned = clean.clean_dataframe(df, date_col="date", value_col="value", fill_strategy="ffill", outlier_threshold=None)
     feat = features.build_feature_pipeline(cleaned, date_col="date", value_col="value", lags=[1, 2], windows=[3])
     # lags created
@@ -43,7 +43,7 @@ def test_lags_and_rolling():
 
 
 def test_encode_categorical():
-    df = _make_sample_df()
+    df = _make_train_df()
     enc = features.encode_categorical(df, cols=["category"])
     assert enc["category"].dtype.kind in "iu"
 

@@ -1,6 +1,6 @@
 # Train runs on startup if no model exists (creates models/artifacts/model_*_baseline.pkl).
 # Now uses improved training with bias correction and better validation.
-# Ensure data/processed/sample_features.csv exists (run features pipeline or copy sample data).
+# Ensure data/processed/train_features.csv exists (run features pipeline or copy training data).
 services:
   api:
     build: .

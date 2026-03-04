@@ -45,7 +45,7 @@ Utilisation rapide (local)
 ```bash
 python src/data/ingest.py --in data/raw --out data/raw
 # ou pour un fichier unique
-python src/data/ingest.py --in data/raw/sample.csv --out data/raw
+python src/data/ingest.py --in data/raw/train.csv --out data/raw
 ```
 
 Sortie : `data/raw/<stem>_ingest.csv` (et optionnellement `<stem>_ingest.csv.metadata.json` si `--write-meta`).
@@ -55,7 +55,7 @@ Sortie : `data/raw/<stem>_ingest.csv` (et optionnellement `<stem>_ingest.csv.met
 ```bash
 python src/data/clean.py --in data/raw --out data/interim --pattern "*_ingest.csv"
 # ou fichier unique
-python src/data/clean.py --in data/raw/sample_ingest.csv --out data/interim
+python src/data/clean.py --in data/raw/train_ingest.csv --out data/interim
 ```
 
 Sortie : `data/interim/<stem>_clean.csv`.
