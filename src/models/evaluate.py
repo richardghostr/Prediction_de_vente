@@ -1,502 +1,198 @@
-"""Evaluation module for trained sales prediction models.
+"""Lightweight evaluator: summarise existing metrics JSON files.
 
-Group-aware version: evaluates models trained on multi-series data
-(store x product groups) without destructive date aggregation.
-
-Supports LightGBM, XGBoost, and ensemble models.
+This script reads `models/metrics/*.json`, extracts test metrics for
+LightGBM, XGBoost and Prophet (when present), prints a short verdict per
+model and an optional consolidated summary file.
 
 Usage:
-    python -m src.models.evaluate
-    python -m src.models.evaluate --horizon 60 --lags 1,2,3,7,14,21,28 --windows 7,14,28
+  python -m src.models.evaluate --all [--save-all]
 """
 
-import argparse
-import json
-import sys
-import warnings
-from math import sqrt
 from pathlib import Path
-from typing import List, Optional, Dict, Any
-
-import joblib
+import json
+import argparse
+from typing import Dict, Any
 import numpy as np
-import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from src.data.features import build_feature_pipeline
-from src.config import (
-    PREDICT_LAGS, PREDICT_WINDOWS, FEATURE_EXCLUDE,
-    GROUP_COLS, CATEGORICAL_FEATURES, TEST_CSV,
-)
-from src.utils.logging import get_logger
-
-logger = get_logger(__name__)
-
-ARTIFACTS_PATH = PROJECT_ROOT / "models" / "artifacts"
 METRICS_PATH = PROJECT_ROOT / "models" / "metrics"
 
 
-def _parse_int_list(s: str) -> List[int]:
-    return [int(x.strip()) for x in s.split(",") if x.strip()]
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def find_latest_model(pattern: str = "model_*_baseline.pkl") -> Optional[Path]:
-    """Return the most recent model artifact."""
-    try:
-        files = list(ARTIFACTS_PATH.glob("model_*.pkl"))
-        if not files:
-            return None
-        return max(files, key=lambda p: p.stat().st_mtime)
-    except Exception:
-        return None
-
-
-def load_model(model_path: Optional[Path] = None):
-    """Load a model from disk. If no path given, find the latest."""
-    if model_path is None:
-        model_path = find_latest_model()
-    if model_path is None:
-        raise FileNotFoundError(f"No model artifact found in {ARTIFACTS_PATH}")
-    model = joblib.load(model_path)
-    logger.info("[evaluate] Loaded model: %s", model_path)
-    return model, model_path
-
-
-def _load_model_config(model_path: Path) -> Optional[Dict[str, Any]]:
-    """Load lags/windows/encoders config saved alongside the model artifact."""
-    config_path = model_path.parent / (model_path.stem + "_config.json")
-    if not config_path.exists():
-        # fallback: try to load latest encoders_*.json if present
-        try:
-            files = sorted(model_path.parent.glob("encoders_*.json"))
-            if files:
-                with open(files[-1]) as fe:
-                    enc = json.load(fe)
-                return {"encoders": enc}
-        except Exception:
-            pass
-        return None
-    try:
-        with open(config_path) as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def compute_metrics(y_true: pd.Series, y_pred: np.ndarray) -> Dict[str, float]:
-    """Compute regression metrics with robust MAPE/sMAPE handling."""
-    yt = np.asarray(y_true, dtype=float)
-    yp = np.asarray(y_pred, dtype=float)
-
-    mae = float(mean_absolute_error(yt, yp))
-    rmse = float(sqrt(mean_squared_error(yt, yp)))
-    r2 = float(r2_score(yt, yp))
-    medae = float(np.median(np.abs(yt - yp)))
-    bias = float(np.mean(yp - yt))
-
-    # MAPE (exclude near-zero actuals)
-    mask = np.abs(yt) >= 1.0
-    mape = float(np.mean(np.abs((yt[mask] - yp[mask]) / yt[mask])) * 100) if mask.any() else float("nan")
-
-    # sMAPE
-    denom = (np.abs(yt) + np.abs(yp))
-    mask_s = denom > 0
-    smape = float(np.mean(2.0 * np.abs(yt[mask_s] - yp[mask_s]) / denom[mask_s]) * 100) if mask_s.any() else float("nan")
-
-    return {"MAE": mae, "RMSE": rmse, "R2": r2, "MedAE": medae, "MAPE": mape, "sMAPE": smape, "Bias": bias}
-
-
-# ---------------------------------------------------------------------------
-# Feature alignment
-# ---------------------------------------------------------------------------
-
-def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
-    """Align a DataFrame to the model's expected features."""
-    if not hasattr(model, "feature_names_in_"):
-        return X.copy()
-
-    expected = list(model.feature_names_in_)
-    out = X.copy()
-
-    # Add missing columns with zeros
-    for col in expected:
-        if col not in out.columns:
-            out.loc[:, col] = 0
-
-    # Drop extra columns
-    extra = [c for c in out.columns if c not in expected]
-    if extra:
-        out = out.drop(columns=extra)
-
-    return out[expected]
-
-
-# ---------------------------------------------------------------------------
-# Diagnostics
-# ---------------------------------------------------------------------------
-
-def _diagnose_data(y_train: pd.Series, y_test: pd.Series) -> Dict[str, Any]:
-    """Generate diagnostic information about the target variable distribution."""
-    diag = {
-        "train_mean": float(y_train.mean()),
-        "train_std": float(y_train.std()),
-        "train_min": float(y_train.min()),
-        "train_max": float(y_train.max()),
-        "train_n": len(y_train),
-        "test_mean": float(y_test.mean()),
-        "test_std": float(y_test.std()),
-        "test_min": float(y_test.min()),
-        "test_max": float(y_test.max()),
-        "test_n": len(y_test),
-    }
-
-    warnings_list = []
-    if diag["train_std"] > 0 and abs(diag["train_mean"] - diag["test_mean"]) > 2 * diag["train_std"]:
-        warnings_list.append("Significant distribution shift between train and test means.")
-    near_zero_pct = float((np.abs(y_test) < 1.0).sum() / len(y_test) * 100) if len(y_test) > 0 else 0
-    if near_zero_pct > 20:
-        warnings_list.append(f"{near_zero_pct:.1f}% of test values are near-zero; MAPE will be unreliable.")
-    diag["warnings"] = warnings_list
-    return diag
-
-
-# ---------------------------------------------------------------------------
-# Main evaluation
-# ---------------------------------------------------------------------------
-
-def evaluate(
-    model_path: Optional[Path] = None,
-    lags: Optional[List[int]] = None,
-    windows: Optional[List[int]] = None,
-    horizon: int = 60,
-) -> Dict[str, Any]:
-    """Full evaluation pipeline (group-aware, no aggregation).
-
-    1. Load model + its config (lags, windows, encoders).
-    2. Rebuild features using the same group-aware pipeline as training.
-    3. Split by date cutoff (same logic as train.py).
-    4. Align features to model expectations.
-    5. Compute train/test metrics.
-    """
-    # 1. Load model
-    model, actual_path = load_model(model_path)
-    model_config = _load_model_config(actual_path)
-
-    # Resolve lags/windows from model config -> CLI -> shared config
-    if model_config:
-        if lags is None:
-            lags = model_config.get("lags", PREDICT_LAGS)
-        if windows is None:
-            windows = model_config.get("windows", PREDICT_WINDOWS)
-        encoders = model_config.get("encoders")
-        logger.info("[evaluate] Using model config: lags=%s, windows=%s", lags, windows)
-    else:
-        if lags is None:
-            lags = PREDICT_LAGS
-        if windows is None:
-            windows = PREDICT_WINDOWS
-        encoders = None
-        logger.info("[evaluate] Using shared config: lags=%s, windows=%s", lags, windows)
-
-    # 2. Load raw data
-    # Priority: model_config.training_features_path > INTERIM test split (TEST_CSV) > processed feature fallback
-    features_source = None
-    if model_config and model_config.get("training_features_path"):
-        cand = Path(model_config.get("training_features_path"))
-        if cand.exists():
-            features_source = cand
-            logger.info("[evaluate] Using model's training features source: %s", features_source)
-
-    if features_source is None:
-        if TEST_CSV.exists():
-            features_source = TEST_CSV
-            logger.info("[evaluate] Using interim test CSV: %s", features_source)
-        else:
-            fallback = PROJECT_ROOT / "data" / "processed" / "train_features.csv"
-            if fallback.exists():
-                features_source = fallback
-            else:
-                sample = PROJECT_ROOT / "data" / "processed" / "train_features.csv"
-                if sample.exists():
-                    features_source = sample
-                else:
-                    logger.error("[evaluate] No data file found. Ensure data/interim/test.csv or processed features exist.")
-                    return 1
-
-    df = pd.read_csv(features_source, parse_dates=["date"]) 
-
-    # Apply basic cleaning consistent with training
-    try:
-        from src.data.clean import clean_dataframe
-        df = clean_dataframe(df, date_col="date", value_col="value", fill_strategy="ffill", outlier_threshold=None)
-        logger.info("[evaluate] Applied clean_dataframe sanitization before feature engineering")
-    except Exception:
-        logger.debug("[evaluate] clean_dataframe not available or failed, continuing without extra sanitization", exc_info=True)
-
-    # Detect group and categorical columns
-    available_groups = [c for c in GROUP_COLS if c in df.columns]
-    # Handle aliases
-    if "store_id" not in df.columns and "id" in df.columns:
-        df = df.rename(columns={"id": "store_id"})
-        if "store_id" not in available_groups:
-            available_groups.append("store_id")
-
-    cat_cols = [c for c in CATEGORICAL_FEATURES if c in df.columns]
-    sort_cols = available_groups + ["date"]
-    df = df.sort_values(sort_cols).reset_index(drop=True)
-
-    # Handle on_promo
-    if "on_promo" in df.columns:
-        df["on_promo"] = df["on_promo"].map(
-            {True: 1, False: 0, "True": 1, "False": 0, 1: 1, 0: 0}
-        ).fillna(0).astype(int)
-
-    logger.info("[evaluate] Loaded %d rows, groups: %s", len(df), available_groups)
-
-    # Run feature pipeline
-    result = build_feature_pipeline(
-        df, lags=lags, windows=windows,
-        group_cols=available_groups if available_groups else None,
-        categorical_cols=cat_cols if cat_cols else None,
-        encoders=encoders,
-        is_train=False,
-    )
-    if isinstance(result, tuple) and len(result) == 2:
-        df, _ = result
-    else:
-        df = result
-
-    df = df.dropna().reset_index(drop=True)
-    logger.info("[evaluate] After feature engineering: %d rows, %d columns", len(df), len(df.columns))
-
-    # 3. Split by date cutoff
-    unique_dates = sorted(df["date"].unique())
-    effective_horizon = horizon
-    if effective_horizon >= len(unique_dates):
-        effective_horizon = max(1, len(unique_dates) // 5)
-        logger.warning("[evaluate] Adjusted horizon to %d (not enough unique dates)", effective_horizon)
-
-    cutoff_date = unique_dates[-effective_horizon]
-    train_mask = df["date"] < cutoff_date
-    test_mask = df["date"] >= cutoff_date
-
-    exclude_cols = set(FEATURE_EXCLUDE) | {"value", "date"}
-    feature_cols = [c for c in df.columns if c not in exclude_cols]
-
-    X_train = df.loc[train_mask, feature_cols].copy()
-    y_train = df.loc[train_mask, "value"].copy()
-    X_test = df.loc[test_mask, feature_cols].copy()
-    y_test = df.loc[test_mask, "value"].copy()
-
-    logger.info(
-        "[evaluate] Train: %d samples, Test: %d samples, cutoff_date=%s",
-        len(y_train), len(y_test), cutoff_date,
-    )
-
-    # 4. Align features to model expectations
-    X_train = _align_features_to_model(X_train, model)
-    X_test = _align_features_to_model(X_test, model)
-
-    # Ensure feature matrices contain only numeric dtypes for tree libraries
-    def _coerce_object_columns(df_in: pd.DataFrame) -> pd.DataFrame:
-        df_out = df_in.copy()
-        for c in df_out.columns:
-            if pd.api.types.is_object_dtype(df_out[c].dtype) or isinstance(df_out[c].dtype, pd.CategoricalDtype):
-                try:
-                    df_out[c] = pd.Categorical(df_out[c]).codes
-                except Exception:
-                    df_out[c] = pd.to_numeric(df_out[c], errors="coerce").fillna(0).astype(float)
-        return df_out
-
-    X_train = _coerce_object_columns(X_train)
-    X_test = _coerce_object_columns(X_test)
-
-    if hasattr(model, "feature_names_in_"):
-        expected = set(model.feature_names_in_)
-        matched = expected & set(feature_cols)
-        missing = expected - set(feature_cols)
-        extra = set(feature_cols) - expected
-        logger.info(
-            "[evaluate] Features: %d matched, %d filled with 0, %d dropped",
-            len(matched), len(missing), len(extra),
-        )
-
-    # Diagnostics
-    diagnostics = _diagnose_data(y_train, y_test)
-    for w in diagnostics.get("warnings", []):
-        logger.warning("[evaluate] DATA WARNING: %s", w)
-
-    # 5. Predict and compute metrics
-    y_pred_train = model.predict(X_train)
-    y_pred_test = model.predict(X_test)
-
-    # If model was trained with a target transform (log1p) invert predictions for metric calculation
-    target_transform = None
-    if model_config:
-        target_transform = model_config.get("target_transform") or ("log1p" if model_config.get("target_log") else None)
-
-    if target_transform == "log1p":
-        try:
-            y_pred_train = np.expm1(y_pred_train)
-            y_pred_test = np.expm1(y_pred_test)
-            logger.info("[evaluate] Inverted log-target predictions via expm1 for metrics")
-        except Exception:
-            logger.debug("[evaluate] Failed to invert log-target predictions", exc_info=True)
-
-    # Ensure true targets are numeric
-    y_train = pd.to_numeric(y_train, errors="coerce").fillna(0).astype(float)
-    y_test = pd.to_numeric(y_test, errors="coerce").fillna(0).astype(float)
-
-    train_metrics = compute_metrics(y_train, y_pred_train)
-    test_metrics = compute_metrics(y_test, y_pred_test)
-
-    overfit_ratio = test_metrics["RMSE"] / train_metrics["RMSE"] if train_metrics["RMSE"] > 0 else float("inf")
-
-    results = {
-        "model_path": str(actual_path),
-        "horizon": effective_horizon,
-        "lags": lags,
-        "windows": windows,
-        "train": train_metrics,
-        "test": test_metrics,
-        "num_train_samples": len(y_train),
-        "num_test_samples": len(y_test),
-        "num_features": X_test.shape[1],
-        "feature_columns": list(X_test.columns),
-        "diagnostics": diagnostics,
-        "overfit_ratio": float(overfit_ratio),
-    }
-
-    # Error analysis by segment (store, dayofweek, month) when possible
-    try:
-        test_df = df.loc[test_mask].copy()
-        # Align predictions
-        test_df = test_df.reset_index(drop=True)
-        preds = list(y_pred_test)
-        # Ensure same length
-        if len(preds) == len(test_df):
-            test_df["y_pred"] = preds
-            test_df["error"] = test_df["y_pred"] - test_df["value"]
-            test_df["abs_error"] = test_df["error"].abs()
-
-            ea = {}
-            if "store_id" in test_df.columns:
-                by_store = test_df.groupby("store_id")["abs_error"].mean().sort_values().to_dict()
-                ea["by_store_mae"] = by_store
-            if "dayofweek" in test_df.columns:
-                by_dow = test_df.groupby("dayofweek")["abs_error"].mean().sort_index().to_dict()
-                ea["by_dayofweek_mae"] = by_dow
-            else:
-                # derive from date if available
-                if "date" in test_df.columns:
-                    test_df["_dow"] = pd.to_datetime(test_df["date"]).dt.dayofweek
-                    by_dow = test_df.groupby("_dow")["abs_error"].mean().sort_index().to_dict()
-                    ea["by_dayofweek_mae"] = by_dow
-
-            if "month" in test_df.columns:
-                by_month = test_df.groupby("month")["abs_error"].mean().sort_index().to_dict()
-                ea["by_month_mae"] = by_month
-            else:
-                if "date" in test_df.columns:
-                    test_df["_month"] = pd.to_datetime(test_df["date"]).dt.month
-                    by_month = test_df.groupby("_month")["abs_error"].mean().sort_index().to_dict()
-                    ea["by_month_mae"] = by_month
-
-            results["error_analysis"] = ea
-    except Exception:
-        logger.debug("[evaluate] Error analysis failed", exc_info=True)
-
-    _print_interpretation(results)
-    return results
-
-
-def _print_interpretation(results: Dict[str, Any]) -> None:
-    """Print human-readable interpretation."""
-    test = results["test"]
-    train = results["train"]
-
-    print(f"\n{'='*60}")
-    print("[evaluate] RESULTS SUMMARY")
-    print(f"{'='*60}")
-    print(f"  Train  -> MAE={train['MAE']:.4f}  RMSE={train['RMSE']:.4f}  R2={train['R2']:.4f}  Bias={train['Bias']:.4f}")
-    print(f"  Test   -> MAE={test['MAE']:.4f}  RMSE={test['RMSE']:.4f}  R2={test['R2']:.4f}  Bias={test['Bias']:.4f}")
-    if not np.isnan(test.get("MAPE", float("nan"))):
-        print(f"  MAPE   -> {test['MAPE']:.2f}%")
-    print(f"  sMAPE  -> {test['sMAPE']:.2f}%")
-    print(f"  MedAE  -> {test['MedAE']:.4f}")
-    print(f"  Overfit ratio: {results['overfit_ratio']:.2f}")
-
-    r2 = test["R2"]
-    if r2 >= 0.85:
-        print("  VERDICT: Excellent model -- strong predictive power.")
-    elif r2 >= 0.7:
-        print("  VERDICT: Good model -- explains significant variance in the data.")
-    elif r2 >= 0.5:
-        print("  VERDICT: Moderate model -- captures key patterns but can improve.")
-    elif r2 >= 0.3:
-        print("  VERDICT: Weak model -- captures very little signal.")
-    elif r2 >= 0:
-        print("  VERDICT: Poor model -- barely better than the mean.")
-    else:
-        print("  VERDICT: Model is WORSE than the mean -- predictions are not useful.")
-
-    if results["overfit_ratio"] > 2.0:
-        print("  WARNING: Significant overfitting detected (ratio > 2x).")
-    elif results["overfit_ratio"] > 3.0:
-        print("  WARNING: Severe overfitting detected (ratio > 3x).")
-    if abs(test.get("Bias", 0)) > test["MAE"] * 0.5:
-        direction = "over" if test["Bias"] > 0 else "under"
-        print(f"  WARNING: Systematic {direction}-prediction (bias={test['Bias']:.4f}).")
-    print(f"{'='*60}\n")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def _verdict_from_r2(r2: float) -> str:
+	if r2 is None or (isinstance(r2, float) and np.isnan(r2)):
+		return "No R2 available"
+	if r2 >= 0.85:
+		return "Excellent model -- strong predictive power."
+	elif r2 >= 0.7:
+		return "Good model -- explains significant variance."
+	elif r2 >= 0.5:
+		return "Moderate model -- useful but improvable."
+	elif r2 >= 0.3:
+		return "Weak model -- limited signal."
+	elif r2 >= 0:
+		return "Poor model -- barely better than mean."
+	else:
+		return "Model worse than mean -- not useful."
+
+
+def _score_models(results_map: Dict[str, Dict[str, Any]]) -> Dict[str, float]:
+	tags = list(results_map.keys())
+	n = len(tags)
+	if n == 0:
+		return {}
+
+	maes = {t: float(results_map[t]['test'].get('MAE', results_map[t]['test'].get('mae', float('inf')))) for t in tags}
+	rmses = {t: float(results_map[t]['test'].get('RMSE', results_map[t]['test'].get('rmse', float('inf')))) for t in tags}
+	r2s = {t: float(results_map[t]['test'].get('R2', results_map[t]['test'].get('r2', float('-inf')))) for t in tags}
+
+	def rank_scores(metric_dict, reverse=False):
+		items = sorted(metric_dict.items(), key=lambda kv: kv[1], reverse=reverse)
+		scores = {}
+		if n == 1:
+			scores[items[0][0]] = 1.0
+			return scores
+		for idx, (tag, _) in enumerate(items):
+			scores[tag] = (n - 1 - idx) / (n - 1)
+		return scores
+
+	mae_scores = rank_scores(maes, reverse=False)
+	rmse_scores = rank_scores(rmses, reverse=False)
+	r2_scores = rank_scores(r2s, reverse=True)
+
+	weights = {'MAE': 0.4, 'RMSE': 0.4, 'R2': 0.2}
+	final = {}
+	for t in tags:
+		sc = mae_scores.get(t, 0.0) * weights['MAE'] + rmse_scores.get(t, 0.0) * weights['RMSE'] + r2_scores.get(t, 0.0) * weights['R2']
+		final[t] = round(float(sc * 100), 2)
+	return final
+
+
+def evaluate_all(save: bool = False) -> Dict[str, Any]:
+	files = sorted(METRICS_PATH.glob('*.json')) if METRICS_PATH.exists() else []
+	results_map: Dict[str, Dict[str, Any]] = {}
+
+	for f in files:
+		name = f.name.lower()
+		if name.startswith('eval_summary'):
+			continue
+
+		if any(k in name for k in ('lgbm', 'lgb', 'lightgbm')):
+			backend = 'LightGBM'
+		elif any(k in name for k in ('xgb', 'xg', 'xgboost')):
+			backend = 'XGBoost'
+		elif 'prophet' in name:
+			backend = 'Prophet'
+		else:
+			backend = f.stem
+
+		try:
+			with open(f, 'r', encoding='utf-8') as fh:
+				data = json.load(fh)
+		except Exception as e:
+			print(f"Failed reading {f}: {e}")
+			continue
+
+		# Heuristic: many metric JSONs use keys like MAE_test, RMSE_test, R2_test
+		test_metrics = {}
+		if isinstance(data, dict):
+			# prefer keys that end with _test_corrected, then _test
+			for key, val in data.items():
+				if key.lower().endswith('_test_corrected'):
+					base = key[:-len('_test_corrected')]
+					test_metrics[base.upper()] = val
+			for key, val in data.items():
+				if key.lower().endswith('_test'):
+					base = key[:-len('_test')]
+					# don't overwrite corrected
+					up = base.upper()
+					if up not in test_metrics:
+						test_metrics[up] = val
+
+			# also accept nested shapes like {'MAE_test':..} under other keys
+			if not test_metrics:
+				if 'test' in data and isinstance(data['test'], dict):
+					for k, v in data['test'].items():
+						test_metrics[k.upper()] = v
+				elif 'metrics' in data and isinstance(data['metrics'], dict):
+					m = data['metrics']
+					if 'test' in m and isinstance(m['test'], dict):
+						for k, v in m['test'].items():
+							test_metrics[k.upper()] = v
+
+		if not test_metrics:
+			print(f"No test metrics found in {f.name}, skipping")
+			continue
+
+		results_map[backend] = {'test': test_metrics, 'source': str(f)}
+
+		# Pull common metrics
+		def _get(metric_key):
+			return test_metrics.get(metric_key) or test_metrics.get(metric_key.upper())
+
+		mae = _get('MAE')
+		rmse = _get('RMSE')
+		r2 = _get('R2')
+		try:
+			mae_v = float(mae) if mae is not None else float('nan')
+		except Exception:
+			mae_v = float('nan')
+		try:
+			rmse_v = float(rmse) if rmse is not None else float('nan')
+		except Exception:
+			rmse_v = float('nan')
+		try:
+			r2_v = float(r2) if r2 is not None else float('nan')
+		except Exception:
+			r2_v = float('nan')
+
+		print(f"\n=== {backend} ({f.name}) ===")
+		print(f"Test metrics -> MAE: {mae_v:.3f}, RMSE: {rmse_v:.3f}, R2: {r2_v:.3f}")
+		print(f"Verdict: {_verdict_from_r2(r2_v)}\n")
+
+	scores = _score_models(results_map)
+	summary = {k: {'metrics': results_map[k]['test'], 'score': scores.get(k)} for k in results_map}
+
+	if save and summary:
+		METRICS_PATH.mkdir(parents=True, exist_ok=True)
+		import datetime
+		ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+		out_path = METRICS_PATH / f'eval_summary_{ts}.json'
+		with open(out_path, 'w', encoding='utf-8') as fh:
+			json.dump({'summary': summary, 'details': results_map}, fh, indent=2, default=str)
+		print(f"Saved consolidated summary to {out_path}")
+
+	if summary:
+		print('\nEvaluation summary (score 0-100):')
+		for k, v in summary.items():
+			met = v.get('metrics')
+			sc = v.get('score')
+			try:
+				maef = float(met.get('MAE', float('nan')))
+				rmsef = float(met.get('RMSE', float('nan')))
+				r2f = float(met.get('R2', float('nan')))
+				print(f"- {k}: score={sc}  MAE={maef:.2f}  RMSE={rmsef:.2f}  R2={r2f:.3f}")
+			except Exception:
+				print(f"- {k}: score={sc}  metrics={met}")
+	else:
+		print('No metrics files found or no usable test metrics in metrics files.')
+
+	return {'summary': summary, 'details': results_map}
+
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Evaluate a trained model artifact")
-    parser.add_argument("--model", type=Path, default=None)
-    parser.add_argument("--lags", default=None)
-    parser.add_argument("--windows", default=None)
-    parser.add_argument("--horizon", type=int, default=60)
-    parser.add_argument("--save", action="store_true")
-    args = parser.parse_args(argv)
+	parser = argparse.ArgumentParser(description='Summarise existing metrics files')
+	parser.add_argument('--all', action='store_true', help='Summarise all metrics files')
+	parser.add_argument('--save-all', action='store_true', help='Save consolidated summary')
+	args = parser.parse_args(argv)
 
-    lags = _parse_int_list(args.lags) if args.lags else None
-    windows = _parse_int_list(args.windows) if args.windows else None
-
-    try:
-        results = evaluate(model_path=args.model, lags=lags, windows=windows, horizon=args.horizon)
-    except Exception as e:
-        print(f"[evaluate] Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-
-    if args.save:
-        METRICS_PATH.mkdir(parents=True, exist_ok=True)
-        import datetime
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = METRICS_PATH / f"eval_metrics_{ts}.json"
-        with open(out_path, "w") as f:
-            json.dump(results, f, indent=2, default=str)
-        print(f"[evaluate] Metrics saved to {out_path}")
-
-    return 0
+	if args.all:
+		evaluate_all(save=args.save_all)
+		return 0
+	else:
+		print('Run with --all to summarise metrics files in models/metrics')
+		return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == '__main__':
+	raise SystemExit(main())
+
