@@ -546,9 +546,10 @@ with st.sidebar:
     )
 
     allow_native_models = st.checkbox(
-        "Autoriser modèles natifs (XGBoost/LightGBM) — peut échouer sur certains systèmes",
-        value=False,
+        "Utiliser le modèle entraîné (XGBoost/LightGBM)",
+        value=True,
         key="sidebar_allow_native",
+        help="Décocher uniquement si le modèle natif échoue sur votre système",
     )
 
     st.divider()

@@ -161,6 +161,70 @@ def _align_features_to_model(X: pd.DataFrame, model) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Seasonality helpers
+# ---------------------------------------------------------------------------
+
+def _compute_weekly_seasonality(df: pd.DataFrame, value_col: str = "value") -> Dict[int, float]:
+    """Compute day-of-week multiplicative seasonality factors from historical data.
+    
+    Returns a dict mapping dayofweek (0=Monday, 6=Sunday) to a multiplier.
+    A factor > 1 means that day tends to have higher values than average.
+    """
+    df = df.copy()
+    df = df.dropna(subset=[value_col])
+    if len(df) < 14:  # Need at least 2 weeks for meaningful seasonality
+        return {}
+    
+    df["dayofweek"] = pd.to_datetime(df["date"]).dt.dayofweek
+    overall_mean = df[value_col].mean()
+    
+    if overall_mean == 0:
+        return {}
+    
+    # Calculate mean by day of week
+    dow_means = df.groupby("dayofweek")[value_col].mean()
+    
+    # Convert to multiplicative factors
+    factors = {}
+    for dow in range(7):
+        if dow in dow_means.index:
+            factors[dow] = dow_means[dow] / overall_mean
+        else:
+            factors[dow] = 1.0
+    
+    return factors
+
+
+def _apply_seasonality_correction(
+    base_prediction: float,
+    date: pd.Timestamp,
+    seasonality_factors: Dict[int, float],
+    strength: float = 0.5,
+) -> float:
+    """Apply day-of-week seasonality to a base prediction.
+    
+    Args:
+        base_prediction: The raw model prediction
+        date: The date being predicted
+        seasonality_factors: Dict of dayofweek -> multiplier
+        strength: How strongly to apply seasonality (0=none, 1=full)
+    
+    Returns:
+        Adjusted prediction
+    """
+    if not seasonality_factors:
+        return base_prediction
+    
+    dow = date.dayofweek
+    factor = seasonality_factors.get(dow, 1.0)
+    
+    # Blend between no adjustment (factor=1) and full adjustment (factor)
+    blended_factor = 1.0 + strength * (factor - 1.0)
+    
+    return base_prediction * blended_factor
+
+
+# ---------------------------------------------------------------------------
 # Core prediction
 # ---------------------------------------------------------------------------
 
@@ -239,11 +303,23 @@ def predict_series(
     group_cols = [c for c in ["store_id", "product_id"] if c in df.columns]
     cat_cols = [c for c in ["store_id", "product_id"] if c in df.columns]
 
+    # Compute weekly seasonality from historical data
+    seasonality_factors = _compute_weekly_seasonality(df, value_col="value")
+    has_seasonality = bool(seasonality_factors)
+    if has_seasonality:
+        print(f"[predict] Weekly seasonality factors: {seasonality_factors}")
+
+    # Working copy of history that we'll extend with predictions
     history = df.copy()
     forecast = []
     used_last_val = False
 
+    # Debug: print feature importance info
+    print(f"[predict] Starting {horizon}-step forecast. History: {len(df)} rows, last_val: {last_val:.2f}")
+    
     for step in range(1, horizon + 1):
+        # REBUILD features from scratch at each step using the extended history
+        # This is the KEY FIX: recalculate all lags, rolling stats correctly
         try:
             feats, _ = build_feature_pipeline(
                 history,
@@ -256,30 +332,45 @@ def predict_series(
                 encoders=encoders,
                 is_train=False,
             )
-        except Exception:
+        except Exception as e:
+            print(f"[predict] Feature pipeline failed at step {step}: {e}")
             feats = None
 
-        if feats is None or feats.dropna().empty:
-            yhat = float(last_val)
-            used_last_val = True
-        else:
-            exclude = set(FEATURE_EXCLUDE) | {"value", "date"}
-            X = feats.drop(columns=[c for c in feats.columns if c in exclude], errors="ignore")
-            X_clean = X.dropna()
-            if X_clean.empty:
-                yhat = float(last_val)
-                used_last_val = True
-            else:
-                X_last = X_clean.iloc[[-1]]
-                X_last = _align_features_to_model(X_last, model)
-                raw = float(model.predict(X_last)[0])
+        raw = None
+        pred_orig = None
+        raw_corrected = None
+        yhat = None
 
-                # Compute corrected prediction taking possible target transforms into account.
-                pred_orig = None
-                raw_corrected = None
+        if feats is not None and not feats.empty:
+            # Get the last valid feature row
+            exclude = set(FEATURE_EXCLUDE) | {"value", "date"}
+            X_base = feats.drop(columns=[c for c in feats.columns if c in exclude], errors="ignore")
+            
+            # Take the LAST row (most recent date = the one we want to predict from)
+            X_last = X_base.iloc[[-1]].copy()
+            
+            # Debug: show key lag values for first few steps
+            if step <= 3:
+                lag_debug = {c: X_last[c].iloc[0] for c in X_last.columns if c.startswith("lag_")}
+                print(f"[predict] Step {step} lags: {lag_debug}")
+            
+            # Check for NaN in critical lag features
+            lag_cols = [c for c in X_last.columns if c.startswith("lag_")]
+            has_valid_lags = True
+            if lag_cols:
+                lag_nulls = X_last[lag_cols].iloc[0].isna().sum()
+                has_valid_lags = lag_nulls < len(lag_cols) // 2  # Allow some missing
+            
+            if has_valid_lags:
+                # Fill remaining NaN with 0 for prediction
+                X_last = X_last.fillna(0)
+                X_last = _align_features_to_model(X_last, model)
+                
                 try:
+                    raw = float(model.predict(X_last)[0])
+
+                    # Compute corrected prediction taking possible target transforms into account.
                     if target_transform == "log1p":
-                        # If bias is stored in transformed space, add it before inverse transform.
                         if bias_space == "transformed":
                             raw_biased = raw + bias_correction
                             try:
@@ -288,21 +379,25 @@ def predict_series(
                                 pred_orig = float(last_val)
                             raw_corrected = pred_orig
                         else:
-                            # bias in original space: inverse then add bias
                             try:
                                 pred_orig = math.expm1(raw)
                             except Exception:
                                 pred_orig = float(last_val)
                             raw_corrected = pred_orig + bias_correction
                     else:
-                        # No target transform: bias is applied directly to model raw output
                         raw_corrected = raw + bias_correction
-                except Exception:
-                    raw_corrected = float(last_val)
 
-                yhat = raw_corrected if math.isfinite(raw_corrected) else float(last_val)
+                    yhat = raw_corrected if math.isfinite(raw_corrected) else None
+                except Exception as e:
+                    print(f"[predict] Model prediction failed at step {step}: {e}")
+                    yhat = None
 
-        # Replace hard silent clipping with configurable floor and logging.
+        # Fallback to last known value if prediction failed
+        if yhat is None:
+            yhat = float(last_val)
+            used_last_val = True
+
+        # Apply floor/clipping
         if not math.isfinite(yhat):
             yhat = float(last_val)
             used_last_val = True
@@ -313,29 +408,43 @@ def predict_series(
                 yhat = prediction_floor
         else:
             if yhat < 0.0:
-                # preserve previous behavior but log the event for visibility
-                print(f"[predict] yhat < 0 ({yhat:.6f}) -> clipping to 0.0 (raw={raw if 'raw' in locals() else 'NA'}, corrected={raw_corrected if 'raw_corrected' in locals() else 'NA'})")
+                print(f"[predict] yhat < 0 ({yhat:.6f}) -> clipping to 0.0")
                 yhat = 0.0
 
         last_date = history["date"].iloc[-1]
         next_date = last_date + pd.Timedelta(days=1)
-        # Include raw diagnostics in the per-day forecast dict to help debugging/inspection.
+        
+        # Apply weekly seasonality correction to add natural variability
+        yhat_before_seasonality = yhat
+        if has_seasonality:
+            yhat = _apply_seasonality_correction(
+                yhat, 
+                pd.to_datetime(next_date), 
+                seasonality_factors, 
+                strength=0.7  # 70% of historical seasonality pattern
+            )
+            # Re-apply floor after seasonality
+            if yhat < 0:
+                yhat = 0.0
+        
+        # Include raw diagnostics in the per-day forecast dict
         fc_item = {"ds": next_date.strftime("%Y-%m-%d"), "yhat": round(yhat, 2)}
-        try:
+        if raw is not None:
             fc_item["raw_model"] = round(raw, 6)
-        except Exception:
-            pass
         if pred_orig is not None:
-            try:
-                fc_item["pred_orig"] = round(float(pred_orig), 6)
-            except Exception:
-                pass
-        try:
+            fc_item["pred_orig"] = round(float(pred_orig), 6)
+        if raw_corrected is not None:
             fc_item["corrected"] = round(float(raw_corrected), 6)
-        except Exception:
-            pass
+        if has_seasonality:
+            fc_item["before_seasonality"] = round(yhat_before_seasonality, 2)
+            fc_item["seasonality_dow"] = pd.to_datetime(next_date).dayofweek
         forecast.append(fc_item)
+        
+        # Debug output for first steps
+        if step <= 3:
+            print(f"[predict] Step {step}: raw={raw}, yhat_base={yhat_before_seasonality:.2f}, yhat_final={yhat:.2f}")
 
+        # CRITICAL: Add prediction to history so next iteration can use it for lags
         new_row = {"date": next_date, "value": yhat}
         for col in group_cols:
             if col in history.columns:
