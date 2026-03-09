@@ -39,13 +39,26 @@ _MODEL_CONFIG = None
 
 def _find_model() -> Optional[Path]:
     """Find the most recent model artifact, preferring ensemble > improved > baseline."""
+    # Prefer canonical 'model_*' patterns (older behavior)
     for pattern in ["model_*_ensemble.pkl", "model_*_improved.pkl", "model_*_baseline.pkl"]:
         files = sorted(ARTIFACTS_PATH.glob(pattern))
         if files:
             return files[-1]
-    # Fallback: any pkl
-    files = sorted(ARTIFACTS_PATH.glob("model_*.pkl"))
-    return files[-1] if files else None
+
+    # Fallback: notebooks may output files with different conventions
+    all_pkls = sorted(ARTIFACTS_PATH.glob("*.pkl"))
+    if not all_pkls:
+        return None
+
+    # Prefer ensemble-like artifacts if present
+    keywords_priority = ["ensemble", "ensemble_regressor", "lgbm", "lgb", "lightgbm", "xgb", "xgboost", "prophet"]
+    for kw in keywords_priority:
+        matches = [p for p in all_pkls if kw in p.name.lower()]
+        if matches:
+            return matches[-1]
+
+    # Otherwise return the newest pkl
+    return all_pkls[-1]
 
 
 def _load_model_config(model_path: Path) -> Dict[str, Any]:

@@ -31,7 +31,25 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    from src.models.predict import predict_series, get_model, get_model_path
+    # Use the unified predictor which supports selecting a backend model name
+    from src.models import predictor as predictor_module
+    predict_series = predictor_module.predict
+    def get_model():
+        try:
+            info = predictor_module.load_model_for('Auto')
+            return info.get('model')
+        except Exception:
+            return None
+    def get_model_path():
+        try:
+            lm = predictor_module.list_models()
+            # return first non-empty path
+            for v in lm.values():
+                if v:
+                    return v
+            return None
+        except Exception:
+            return None
 except Exception:
     predict_series = None
     get_model = None
@@ -143,8 +161,8 @@ def run_offline_prediction(
     # If local native models are disabled by the UI, skip calling predict_series entirely.
     if allow_local_models and predict_series is not None:
         try:
-            # let predict_series handle XGBoost/LightGBM/ensemble logic
-            return predict_series(series, horizon=horizon)
+            # let predictor handle model_name selection (Auto/XGBoost/LightGBM/Prophet)
+            return predict_series(series, horizon=horizon, model_name=model_choice or 'Auto')
         except Exception as e:
             # If the failure is due to missing native runtime (eg. libgomp), show a concise message
             msg = str(e)
@@ -567,9 +585,22 @@ def render_predict_ui() -> None:
     with c2:
         mode = st.radio("Mode", options=["Hors-ligne", "En ligne (API)"], horizontal=True, key="predict_mode")
 
-    # Model status
-    if get_model_path:
-        try:
+    # Model status for currently selected backend
+    sel_backend = st.session_state.get("predict_model_backend", "Auto")
+    try:
+        if 'predictor_module' in globals() and predictor_module is not None:
+            models_map = predictor_module.list_models()
+            mp = models_map.get(sel_backend)
+            if mp:
+                st.markdown(
+                    f"<div style='background: #EAFAF1; border-left: 4px solid {PALETTE['success']}; "
+                    f"padding: 0.5rem 1rem; border-radius: 0 0.5rem 0.5rem 0;'>"
+                    f"<strong>Modele ({sel_backend}) :</strong> {Path(mp).name}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.warning(f"Aucun artefact de modele trouve pour '{sel_backend}'. La prediction naive sera utilisee.")
+        elif get_model_path:
             mp = get_model_path()
             if mp:
                 st.markdown(
@@ -580,8 +611,10 @@ def render_predict_ui() -> None:
                 )
             else:
                 st.warning("Aucun artefact de modele trouve. La prediction naive sera utilisee.")
-        except Exception:
-            st.warning("Impossible de verifier le statut du modele.")
+        else:
+            st.info("Impossible de verifier le statut du modele.")
+    except Exception:
+        st.warning("Impossible de verifier le statut du modele.")
 
     # Backend selection for offline prediction
     model_backend = st.selectbox(

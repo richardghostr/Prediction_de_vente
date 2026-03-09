@@ -16,3 +16,5 @@ seaborn>=0.12
 httpx>=0.24
 plotly>=5.14
 statsmodels>=0.14
+nbconvert>=7.0
+nbformat>=5.7

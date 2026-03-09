@@ -48,7 +48,24 @@ except Exception:
     build_feature_pipeline = None
 
 try:
-    from src.models.predict import predict_series, get_model, get_model_path
+    from src.models import predictor as predictor_module
+    predict_series = predictor_module.predict
+    def get_model():
+        # best-effort: return loaded model object if any
+        try:
+            info = predictor_module.load_model_for('Auto')
+            return info.get('model')
+        except Exception:
+            return None
+    def get_model_path():
+        try:
+            lm = predictor_module.list_models()
+            for v in lm.values():
+                if v:
+                    return v
+            return None
+        except Exception:
+            return None
 except Exception:
     predict_series = None
     get_model = None
@@ -524,18 +541,30 @@ with st.sidebar:
     # Show persistence indicator
     if st.session_state.get("df_raw") is not None:
         st.info("💾 Données en cache")
-    
-    if get_model_path:
-        try:
+
+    # Determine which backend the user has selected (if any) and show the
+    # corresponding artifact status. We read from session_state so the status
+    # block is reactive even if the selectbox widget is rendered later.
+    sel_backend = st.session_state.get("sidebar_model_backend", "Auto")
+    try:
+        if 'predictor_module' in globals() and predictor_module is not None:
+            models_map = predictor_module.list_models()
+            mp = models_map.get(sel_backend)
+            if mp:
+                st.success(f"Modele ({sel_backend}) : {Path(mp).name}")
+            else:
+                st.warning(f"Aucun artefact trouve pour le backend '{sel_backend}'")
+        elif get_model_path:
+            # fallback to older get_model_path behaviour
             mp = get_model_path()
             if mp:
                 st.success(f"Modele : {Path(mp).name}")
             else:
                 st.warning("Aucun artefact trouve")
-        except Exception:
-            st.warning("Impossible de charger le modele")
-    else:
-        st.info("Module de prediction non disponible")
+        else:
+            st.info("Module de prediction non disponible")
+    except Exception:
+        st.warning("Impossible de verifier le statut du modele")
 
     # Backend selection for offline prediction and native model toggle
     model_backend = st.selectbox(
@@ -1435,22 +1464,26 @@ with tab_predict:
 
         if offline:
             with st.spinner("Prediction en cours (mode hors-ligne)..."):
-                # Try to ensure `predict_series` is available. The module-level import
-                # may have failed earlier (graceful degradation). Attempt a dynamic
-                # import as a fallback so the local model can still be used when
-                # available instead of always falling back to the naive predictor.
+                # Resolve the best local predictor. Prefer the unified `src.models.predictor`
+                # which supports selecting a backend model name. Fall back to the older
+                # `src.models.predict.predict_series` if needed.
                 local_predict = predict_series
                 if local_predict is None:
                     try:
                         import importlib
-                        mod = importlib.import_module("src.models.predict")
-                        local_predict = getattr(mod, "predict_series", None)
+                        # try predictor module first
+                        mod = importlib.import_module("src.models.predictor")
+                        local_predict = getattr(mod, "predict", None)
+                        if local_predict is None:
+                            mod2 = importlib.import_module("src.models.predict")
+                            local_predict = getattr(mod2, "predict_series", None)
                     except Exception:
                         local_predict = None
 
                 if local_predict is not None and allow_native_models:
                     try:
-                        forecast_result = local_predict(series_payload, horizon=horizon)
+                        # pass selected backend so UI choice is honored (Auto/XGBoost/Prophet/LightGBM)
+                        forecast_result = local_predict(series_payload, horizon=horizon, model_name=model_backend)
                     except Exception as e:
                         msg = str(e)
                         # Hide verbose native runtime errors (libgomp) from the UI
@@ -1675,67 +1708,99 @@ with tab_predict:
 with tab_model:
     st.header("Informations sur le modele et metriques")
 
-    # Model info
+    # Model info (dynamic per selected backend)
     st.subheader("Modele charge")
-    if get_model is not None:
-        try:
-            model = get_model()
-            mp = get_model_path()
-            st.success(f"Modele : {Path(mp).name if mp else 'N/A'}")
+    sel_backend = st.session_state.get("sidebar_model_backend", "Auto")
+    try:
+        if 'predictor_module' in globals() and predictor_module is not None:
+            try:
+                info = predictor_module.load_model_for(sel_backend)
+            except FileNotFoundError:
+                st.warning(f"Aucun artefact trouve pour le backend '{sel_backend}'.")
+                info = None
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(f"**Type** : `{type(model).__name__}`")
-                st.markdown(f"**Chemin** : `{mp}`")
-            with c2:
-                if hasattr(model, "n_estimators"):
-                    st.markdown(f"**N estimators** : `{model.n_estimators}`")
-                if hasattr(model, "max_depth"):
-                    st.markdown(f"**Max depth** : `{model.max_depth}`")
-                if hasattr(model, "learning_rate"):
-                    st.markdown(f"**Learning rate** : `{model.learning_rate}`")
+            if info:
+                model = info.get('model')
+                mp = info.get('path')
+                cfg = info.get('config', {})
+                st.success(f"Modele ({sel_backend}) : {Path(mp).name if mp else 'N/A'}")
 
-            # Feature importance
-            feature_names = None
-            importances = None
-            if hasattr(model, "feature_importances_"):
-                importances = model.feature_importances_
-                if hasattr(model, "feature_names_in_"):
-                    feature_names = list(model.feature_names_in_)
-                elif hasattr(model, "get_booster"):
-                    try:
-                        feature_names = model.get_booster().feature_names
-                    except Exception:
-                        pass
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown(f"**Type** : `{type(model).__name__}`")
+                    st.markdown(f"**Chemin** : `{mp}`")
+                with c2:
+                    if hasattr(model, "n_estimators"):
+                        st.markdown(f"**N estimators** : `{model.n_estimators}`")
+                    if hasattr(model, "max_depth"):
+                        st.markdown(f"**Max depth** : `{model.max_depth}`")
+                    if hasattr(model, "learning_rate"):
+                        st.markdown(f"**Learning rate** : `{model.learning_rate}`")
 
-            if importances is not None and feature_names is not None:
-                st.divider()
-                st.subheader("Importance des features")
-                imp_df = pd.DataFrame({
-                    "Feature": feature_names,
-                    "Importance": importances,
-                }).sort_values("Importance", ascending=True)
+                # Feature importance
+                feature_names = None
+                importances = None
+                if hasattr(model, "feature_importances_"):
+                    importances = model.feature_importances_
+                    if hasattr(model, "feature_names_in_"):
+                        feature_names = list(model.feature_names_in_)
+                    elif hasattr(model, "get_booster"):
+                        try:
+                            feature_names = model.get_booster().feature_names
+                        except Exception:
+                            pass
 
-                fig_imp = px.bar(
-                    imp_df, x="Importance", y="Feature",
-                    orientation="h",
-                    color="Importance",
-                    color_continuous_scale=[[0, "#EBF5FB"], [1, PALETTE["primary"]]],
-                )
-                fig_imp.update_layout(
-                    height=max(300, len(feature_names) * 30),
-                    showlegend=False,
-                    coloraxis_showscale=False,
-                    margin=dict(l=0, r=0, t=10, b=0),
-                )
-                st.plotly_chart(fig_imp, use_container_width=True)
+                if importances is not None and feature_names is not None:
+                    st.divider()
+                    st.subheader("Importance des features")
+                    imp_df = pd.DataFrame({
+                        "Feature": feature_names,
+                        "Importance": importances,
+                    }).sort_values("Importance", ascending=True)
 
-        except FileNotFoundError:
-            st.warning("Aucun artefact de modele trouve dans `models/artifacts/`.")
-        except Exception as e:
-            st.error(f"Erreur lors du chargement du modele : {e}")
-    else:
-        st.info("Module `predict` non disponible dans l'environnement actuel.")
+                    fig_imp = px.bar(
+                        imp_df, x="Importance", y="Feature",
+                        orientation="h",
+                        color="Importance",
+                        color_continuous_scale=[[0, "#EBF5FB"], [1, PALETTE["primary"]]],
+                    )
+                    fig_imp.update_layout(
+                        height=max(300, len(feature_names) * 30),
+                        showlegend=False,
+                        coloraxis_showscale=False,
+                        margin=dict(l=0, r=0, t=10, b=0),
+                    )
+                    st.plotly_chart(fig_imp, use_container_width=True)
+            else:
+                # no model for this backend
+                pass
+
+        elif get_model is not None:
+            # legacy fallback: show default model
+            try:
+                model = get_model()
+                mp = get_model_path()
+                st.success(f"Modele : {Path(mp).name if mp else 'N/A'}")
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown(f"**Type** : `{type(model).__name__}`")
+                    st.markdown(f"**Chemin** : `{mp}`")
+                with c2:
+                    if hasattr(model, "n_estimators"):
+                        st.markdown(f"**N estimators** : `{model.n_estimators}`")
+                    if hasattr(model, "max_depth"):
+                        st.markdown(f"**Max depth** : `{model.max_depth}`")
+                    if hasattr(model, "learning_rate"):
+                        st.markdown(f"**Learning rate** : `{model.learning_rate}`")
+            except FileNotFoundError:
+                st.warning("Aucun artefact de modele trouve dans `models/artifacts/`.")
+            except Exception as e:
+                st.error(f"Erreur lors du chargement du modele : {e}")
+        else:
+            st.info("Module `predict` non disponible dans l'environnement actuel.")
+    except Exception as e:
+        st.error(f"Erreur lors du chargement dynamique du modele : {e}")
 
     # Features preview
     if features_df is not None:
@@ -1758,8 +1823,22 @@ with tab_model:
         st.divider()
         st.subheader("Metriques sauvegardees")
         metrics_dir = Path(config.MODELS_METRICS_DIR) if config and hasattr(config, "MODELS_METRICS_DIR") else Path("models/metrics")
+        sel_backend = st.session_state.get("sidebar_model_backend", "Auto")
         if metrics_dir.exists():
-            json_files = sorted(metrics_dir.glob("*.json"), reverse=True)
+            all_json = sorted(metrics_dir.glob("*.json"), reverse=True)
+            # filter by backend keywords when a specific backend is selected
+            keywords_map = {
+                'LightGBM': ['lgbm', 'lgb', 'lightgbm'],
+                'XGBoost': ['xgb', 'xg', 'xgboost'],
+                'Prophet': ['prophet'],
+                'Auto': []
+            }
+            kws = keywords_map.get(sel_backend, [])
+            if kws:
+                json_files = [f for f in all_json if any(kw in f.name.lower() for kw in kws)]
+            else:
+                json_files = all_json
+
             if json_files:
                 selected_metric = st.selectbox(
                     "Selectionner un fichier de metriques",
