@@ -592,9 +592,10 @@ def render_predict_ui() -> None:
     )
 
     allow_native = st.checkbox(
-        "Autoriser modèles natifs (XGBoost/LightGBM) — peut échouer sur certains systèmes",
-        value=False,
+        "Utiliser le modèle entraîné (XGBoost/LightGBM)",
+        value=True,
         key="predict_allow_native",
+        help="Décocher uniquement si le modèle natif échoue sur votre système",
     )
 
     debug_show = st.checkbox(
